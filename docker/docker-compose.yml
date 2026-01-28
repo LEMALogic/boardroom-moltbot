@@ -1,0 +1,169 @@
+# =============================================================================
+# Boardroom Moltbot - Docker Compose Configuration
+# =============================================================================
+# Local single-user development environment
+#
+# Architecture:
+# -------------
+# This setup provides two main services for local Boardroom development:
+#
+# 1. CONSOLE (boardroom-console)
+#    - The main Boardroom application/terminal interface
+#    - Exposes port 18789 for the web-based console UI
+#    - Exposes port 2222 for SSH access (mapped from container's port 22)
+#    - Mounts local directories for logs and user configuration persistence
+#    - Depends on the proxy service being available first
+#
+# 2. PROXY (boardroom-proxy)
+#    - Forward proxy (squid-style) for ALL outbound HTTP/HTTPS traffic
+#    - Automatically injects API keys for known providers (Anthropic, OpenAI)
+#    - Keeps API keys secure - console container has NO API keys
+#    - Port 8080: Direct API endpoints and admin UI
+#    - Port 3128: Forward proxy (HTTP_PROXY) for transparent interception
+#
+# Network Flow:
+#   User -> Console (443) -> HTTP_PROXY (3128) -> Proxy injects keys -> External APIs
+#
+# To start:   docker compose up -d
+# To stop:    docker compose down
+# To rebuild: docker compose build --no-cache
+# View logs:  docker compose logs -f [service-name]
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Console Service - Main Boardroom Application (NO API KEYS HERE)
+  # ---------------------------------------------------------------------------
+  # The primary user-facing service providing the Boardroom terminal/console
+  # interface. This is where users interact with the AI-powered executive system.
+  #
+  # SECURITY: This container has ZERO API keys. All API traffic routes through
+  # the proxy container via HTTP_PROXY/HTTPS_PROXY environment variables.
+  # Moltbot config uses placeholder values that the MITM proxy replaces.
+  console:
+    container_name: boardroom-console
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.console
+    ports:
+      # Web console interface - use 443 for easy access (gateway listens on 19001 internally)
+      - "443:19001"
+      # SSH access for remote terminal connections
+      - "2222:22"
+    environment:
+      # Development mode enables verbose logging and hot reloading
+      - NODE_ENV=development
+      # Single-user development identifier
+      - BOARDROOM_USER=dev
+      # Gateway authentication token (required for moltbot)
+      - CLAWDBOT_GATEWAY_TOKEN=${GATEWAY_TOKEN:-boardroom-dev-token}
+      # Bind to all interfaces so Docker port forwarding works
+      - CLAWDBOT_GATEWAY_HOST=0.0.0.0
+      # Forward proxy: ALL HTTP traffic routes through proxy for key injection
+      - HTTP_PROXY=http://proxy:3128
+      - http_proxy=http://proxy:3128
+      # HTTPS traffic also through proxy (tunneled, keys injected for known hosts)
+      - HTTPS_PROXY=http://proxy:3128
+      - https_proxy=http://proxy:3128
+      # Don't proxy local traffic
+      - NO_PROXY=localhost,127.0.0.1,proxy
+      - no_proxy=localhost,127.0.0.1,proxy
+    volumes:
+      # Persist application logs outside the container
+      - ../logs:/logs
+      # Persist user configuration and settings
+      - ../config:/home/boardroom/.boardroom
+      # Mount MITM proxy CA cert for HTTPS interception trust
+      - proxy-certs:/etc/boardroom-proxy-certs:ro
+    networks:
+      - boardroom-network
+    depends_on:
+      # Ensure proxy is available before console starts
+      - proxy
+    healthcheck:
+      # Verify the console service is responding
+      test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Proxy Service - MITM API Gateway (ALL API KEYS LIVE HERE)
+  # ---------------------------------------------------------------------------
+  # This is the ONLY container with real API keys. The console has NONE.
+  #
+  # How it works:
+  # 1. Console sends request to api.anthropic.com (with placeholder/no key)
+  # 2. HTTP_PROXY routes traffic through this proxy (port 3128)
+  # 3. Proxy intercepts, adds real API key, forwards to actual API
+  # 4. Response flows back through proxy to console
+  #
+  # Security: Even if AI extracts all env vars from console, no keys to find.
+  proxy:
+    container_name: boardroom-proxy
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.proxy
+    ports:
+      # Admin UI and health checks
+      - "8080:8080"
+      # MITM proxy - all console traffic routes through here
+      - "3128:3128"
+    environment:
+      # =======================================================================
+      # API KEYS - ONLY place in the entire system where real keys exist
+      # Load from .env file: docker compose --env-file .env up
+      # The proxy auto-injects keys when traffic matches known API hosts.
+      # =======================================================================
+      # LLM Providers
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GOOGLE_AI_API_KEY=${GOOGLE_AI_API_KEY:-}
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
+      - COHERE_API_KEY=${COHERE_API_KEY:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - PERPLEXITY_API_KEY=${PERPLEXITY_API_KEY:-}
+      - TOGETHER_API_KEY=${TOGETHER_API_KEY:-}
+      - FIREWORKS_API_KEY=${FIREWORKS_API_KEY:-}
+      - HUGGINGFACE_API_KEY=${HUGGINGFACE_API_KEY:-}
+      - REPLICATE_API_TOKEN=${REPLICATE_API_TOKEN:-}
+      # Image/Media
+      - IDEOGRAM_API_KEY=${IDEOGRAM_API_KEY:-}
+      - STABILITY_API_KEY=${STABILITY_API_KEY:-}
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY:-}
+      # Voice/Communication
+      - RETELL_API_KEY=${RETELL_API_KEY:-}
+      - RESEND_API_KEY=${RESEND_API_KEY:-}
+      # Proxy ports
+      - PORT=8080
+      - PROXY_PORT=3128
+    volumes:
+      # Persist proxy data (caching, rate limiting state, etc.)
+      - ../proxy-data:/data
+      # Generated MITM CA certificates (shared with console)
+      - proxy-certs:/app/api-proxy/certs/.http-mitm-proxy
+    networks:
+      - boardroom-network
+    restart: unless-stopped
+
+# =============================================================================
+# Networks
+# =============================================================================
+# Isolated bridge network for inter-service communication.
+# Services can reference each other by container name (e.g., proxy:8080)
+networks:
+  boardroom-network:
+    driver: bridge
+
+# =============================================================================
+# Volumes
+# =============================================================================
+# Named volumes for data persistence across container restarts.
+# These map to the ./logs, ./config, and ./proxy-data directories.
+volumes:
+  logs:
+  config:
+  proxy-data:
+  proxy-certs:

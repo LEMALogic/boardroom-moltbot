@@ -1,0 +1,321 @@
+# =============================================================================
+# Boardroom Console Container
+# =============================================================================
+# This Dockerfile creates a development environment for the Boardroom multi-agent
+# executive system. It includes all necessary tools for AI development, browser
+# automation, and system administration.
+#
+# Build: docker build -t boardroom-console -f docker/Dockerfile.console .
+# Run:   docker run -d -p 18789:18789 -p 2222:22 boardroom-console
+# =============================================================================
+
+FROM ubuntu:24.04
+
+# -----------------------------------------------------------------------------
+# Environment Configuration
+# -----------------------------------------------------------------------------
+# Set non-interactive mode for apt to avoid prompts during build
+# Configure locale and timezone for consistent behavior
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=en_US.UTF-8 \
+    LANGUAGE=en_US:en \
+    LC_ALL=en_US.UTF-8 \
+    TZ=UTC
+
+# -----------------------------------------------------------------------------
+# System Dependencies
+# -----------------------------------------------------------------------------
+# Install core system packages:
+# - build-essential: C/C++ compiler toolchain for native module compilation
+# - curl, wget: HTTP clients for downloading packages
+# - git: Version control for cloning repositories
+# - openssh-server: SSH daemon for remote access
+# - sudo: Privilege escalation for the non-root user
+# - locales: Language/locale support
+# - ca-certificates: SSL certificate authorities
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    wget \
+    git \
+    openssh-server \
+    sudo \
+    locales \
+    ca-certificates \
+    gnupg \
+    lsb-release \
+    && locale-gen en_US.UTF-8 \
+    && rm -rf /var/lib/apt/lists/*
+
+# -----------------------------------------------------------------------------
+# Python Installation
+# -----------------------------------------------------------------------------
+# Install Python 3 with pip and venv for AI/ML library support
+# - python3: Python interpreter
+# - python3-pip: Package installer
+# - python3-venv: Virtual environment support
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    python3-venv \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# -----------------------------------------------------------------------------
+# Playwright Browser Dependencies
+# -----------------------------------------------------------------------------
+# Install system libraries required by Playwright for browser automation
+# These are needed for headless Chrome/Chromium to function properly:
+# - libnss3: Network Security Services for SSL/TLS
+# - libatk-bridge2.0-0: Accessibility toolkit bridge
+# - libdrm2: Direct Rendering Manager for GPU access
+# - libxkbcommon0: Keyboard handling library
+# - libgbm1: Generic Buffer Management for graphics
+# - Additional X11 and font libraries for rendering
+RUN apt-get update && apt-get install -y \
+    libnss3 \
+    libnss3-dev \
+    libatk-bridge2.0-0 \
+    libdrm2 \
+    libxkbcommon0 \
+    libgbm1 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libcups2 \
+    libpango-1.0-0 \
+    libcairo2 \
+    libasound2t64 \
+    libatspi2.0-0 \
+    fonts-liberation \
+    xdg-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# -----------------------------------------------------------------------------
+# Image Processing Dependencies
+# -----------------------------------------------------------------------------
+# Install libvips for sharp image processing library
+# libvips is a fast image processing library used by the 'sharp' npm package
+# for high-performance image resizing, conversion, and manipulation
+RUN apt-get update && apt-get install -y \
+    libvips-dev \
+    libvips-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+# -----------------------------------------------------------------------------
+# Go Installation
+# -----------------------------------------------------------------------------
+# Install Go programming language via apt for building Go-based tools
+# Used for various CLI tools and MCP servers
+RUN apt-get update && apt-get install -y \
+    golang-go \
+    && rm -rf /var/lib/apt/lists/*
+
+# -----------------------------------------------------------------------------
+# Create Non-Root User
+# -----------------------------------------------------------------------------
+# Create 'boardroom' user with sudo access for security best practices
+# - Use UID/GID 1001 to avoid conflicts with existing ubuntu user (1000)
+# - Passwordless sudo for convenience in development
+# - Home directory at /home/boardroom
+RUN groupadd --gid 1001 boardroom \
+    && useradd --uid 1001 --gid boardroom --shell /bin/bash --create-home boardroom \
+    && echo 'boardroom ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers.d/boardroom \
+    && chmod 0440 /etc/sudoers.d/boardroom
+
+# -----------------------------------------------------------------------------
+# SSH Server Configuration
+# -----------------------------------------------------------------------------
+# Configure SSH daemon for remote access:
+# - Create privilege separation directory
+# - Generate host keys for SSH connections
+# - Configure SSH to allow password authentication (for development)
+RUN mkdir -p /var/run/sshd \
+    && ssh-keygen -A \
+    && sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config \
+    && sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config \
+    && echo 'boardroom:boardroom' | chpasswd
+
+# -----------------------------------------------------------------------------
+# Switch to Non-Root User
+# -----------------------------------------------------------------------------
+USER boardroom
+WORKDIR /home/boardroom
+
+# -----------------------------------------------------------------------------
+# NVM and Node.js Installation
+# -----------------------------------------------------------------------------
+# Install Node Version Manager (nvm) and Node.js 22
+# Node.js 22.12.0+ is required for security patches
+# Also install pnpm as the package manager
+ENV NVM_DIR=/home/boardroom/.nvm
+
+RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash \
+    && . "$NVM_DIR/nvm.sh" \
+    && nvm install 22 \
+    && nvm alias default 22 \
+    && nvm use default \
+    && npm install -g pnpm
+
+# Source nvm in each RUN command - create a wrapper script
+RUN echo '#!/bin/bash\n\
+source $NVM_DIR/nvm.sh\n\
+exec "$@"' > /home/boardroom/.nvm-exec \
+    && chmod +x /home/boardroom/.nvm-exec
+
+# Verify Node.js version meets security requirements (22.12.0+)
+SHELL ["/bin/bash", "-c"]
+RUN source $NVM_DIR/nvm.sh && node --version && npm --version && pnpm --version
+
+# -----------------------------------------------------------------------------
+# Homebrew (Linuxbrew) Installation
+# -----------------------------------------------------------------------------
+# Install Homebrew for Linux to provide access to additional packages
+# Homebrew is useful for installing tools not available in apt
+ENV HOMEBREW_PREFIX=/home/linuxbrew/.linuxbrew
+ENV PATH="$HOMEBREW_PREFIX/bin:$HOMEBREW_PREFIX/sbin:$PATH"
+
+# Homebrew requires SSSE3 on x86_64, which may not work in QEMU emulation
+# Make installation optional - skip if it fails
+RUN /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" \
+    && echo 'eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"' >> /home/boardroom/.bashrc \
+    || echo "Homebrew installation skipped (not supported on this platform)"
+
+# -----------------------------------------------------------------------------
+# Python LLM Libraries
+# -----------------------------------------------------------------------------
+# Install Python libraries for AI/ML development:
+# - openai: OpenAI API client for GPT models
+# - anthropic: Anthropic API client for Claude models
+# - httpx: Modern async HTTP client
+# - requests: Classic HTTP library
+# - pandas: Data analysis and manipulation
+# - numpy: Numerical computing
+RUN pip3 install --user --break-system-packages \
+    openai \
+    anthropic \
+    httpx \
+    requests \
+    pandas \
+    numpy
+
+# Add Python user packages to PATH
+ENV PATH="/home/boardroom/.local/bin:$PATH"
+
+# -----------------------------------------------------------------------------
+# Working Directory Setup
+# -----------------------------------------------------------------------------
+# Create /app directory for the application
+# This will be owned by the boardroom user
+USER root
+RUN mkdir -p /app && chown boardroom:boardroom /app
+USER boardroom
+WORKDIR /app
+
+# -----------------------------------------------------------------------------
+# Clone and Install Moltbot
+# -----------------------------------------------------------------------------
+# Clone the moltbot repository and install dependencies
+# Moltbot is the multi-tenant bot framework for the Boardroom system
+RUN git clone https://github.com/moltbot/moltbot.git /app/moltbot \
+    && cd /app/moltbot \
+    && source $NVM_DIR/nvm.sh \
+    && pnpm install
+
+# -----------------------------------------------------------------------------
+# Apply Boardroom Branding
+# -----------------------------------------------------------------------------
+# Copy and run the branding patch script
+COPY --chown=boardroom:boardroom patches/apply-branding.sh /tmp/apply-branding.sh
+RUN chmod +x /tmp/apply-branding.sh && /tmp/apply-branding.sh /app/moltbot
+
+# -----------------------------------------------------------------------------
+# Build Control UI
+# -----------------------------------------------------------------------------
+# Build the web-based Control UI assets (with Boardroom branding)
+RUN cd /app/moltbot \
+    && source $NVM_DIR/nvm.sh \
+    && pnpm ui:build
+
+# -----------------------------------------------------------------------------
+# Install Playwright Browsers
+# -----------------------------------------------------------------------------
+# Install Playwright browsers for browser automation
+# Moltbot uses playwright-core for browser automation
+# This downloads Chromium for headless browser testing
+RUN cd /app/moltbot \
+    && source $NVM_DIR/nvm.sh \
+    && pnpm exec playwright-core install chromium
+
+# -----------------------------------------------------------------------------
+# Expose Ports
+# -----------------------------------------------------------------------------
+# - 18789: Moltbot gateway API port
+# - 22: SSH daemon for remote access
+EXPOSE 18789 22
+
+# -----------------------------------------------------------------------------
+# Entrypoint Script
+# -----------------------------------------------------------------------------
+# Create an entrypoint script that:
+# 1. Starts the SSH daemon for remote access
+# 2. Starts the moltbot gateway service
+# The script runs SSH in the background and gateway in foreground
+# -----------------------------------------------------------------------------
+# Configure Moltbot for Docker
+# -----------------------------------------------------------------------------
+# Set gateway to bind to all interfaces (required for Docker port forwarding)
+# Dev mode uses ~/.clawdbot-dev/moltbot.json
+# gateway.mode=local is required for LAN binding
+USER boardroom
+# Create moltbot config with:
+# - Gateway bound to LAN for Docker port forwarding
+# - Device auth disabled for local dev
+# - NO explicit proxy URL - HTTPS_PROXY env handles routing transparently
+# - Placeholder API key (MITM proxy injects real keys)
+RUN mkdir -p /home/boardroom/.moltbot /home/boardroom/.clawdbot-dev && \
+    echo '{\
+  "gateway": {\
+    "bind": "lan",\
+    "port": 19001,\
+    "mode": "local",\
+    "controlUi": {\
+      "dangerouslyDisableDeviceAuth": true\
+    }\
+  },\
+  "models": {\
+    "providers": {\
+      "anthropic": {\
+        "apiKey": "placeholder-set-via-env-or-proxy",\
+        "baseUrl": "https://api.anthropic.com",\
+        "api": "anthropic-messages",\
+        "models": []\
+      },\
+      "openai": {\
+        "apiKey": "placeholder-set-via-env-or-proxy",\
+        "baseUrl": "https://api.openai.com/v1",\
+        "models": []\
+      }\
+    }\
+  }\
+}' > /home/boardroom/.moltbot/moltbot.json && \
+    cp /home/boardroom/.moltbot/moltbot.json /home/boardroom/.clawdbot-dev/moltbot.json
+
+# -----------------------------------------------------------------------------
+# Entrypoint Script
+# -----------------------------------------------------------------------------
+# The entrypoint script:
+# 1. Installs the MITM proxy CA cert (mounted at runtime)
+# 2. Configures Python/Node to trust the CA cert
+# 3. Starts the SSH daemon
+# 4. Starts the moltbot gateway
+USER root
+RUN printf '#!/bin/bash\nset -e\n\n# Install MITM proxy CA cert if available\nCA_CERT="/etc/boardroom-proxy-certs/ca.pem"\nif [ -f "$CA_CERT" ]; then\n    echo "Installing MITM proxy CA certificate..."\n    cp "$CA_CERT" /usr/local/share/ca-certificates/boardroom-proxy.crt\n    update-ca-certificates\n    # Also set for Python requests/httpx\n    export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\n    export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt\n    export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt\nelse\n    echo "Warning: MITM proxy CA cert not found at $CA_CERT"\n    echo "HTTPS traffic may not be intercepted correctly."\nfi\n\n# Start SSH daemon in background\necho "Starting SSH daemon..."\n/usr/sbin/sshd\n\n# Switch to boardroom user and start the gateway\necho "Starting Boardroom Command Center..."\ncd /app/moltbot\nexec su - boardroom -c "export CLAWDBOT_GATEWAY_TOKEN=$CLAWDBOT_GATEWAY_TOKEN && export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt && export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt && export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt && source ~/.nvm/nvm.sh && cd /app/moltbot && pnpm run gateway:dev"\n' > /usr/local/bin/entrypoint.sh \
+    && chmod +x /usr/local/bin/entrypoint.sh
+
+# -----------------------------------------------------------------------------
+# Container Startup
+# -----------------------------------------------------------------------------
+# Run entrypoint as root (required for SSH), which then switches to boardroom
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

@@ -1,0 +1,229 @@
+#cloud-config
+# =============================================================================
+# Boardroom - Cloud-Init Configuration
+# =============================================================================
+# This runs on first boot to configure the server with Docker and dependencies
+# =============================================================================
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - apt-transport-https
+  - ca-certificates
+  - curl
+  - gnupg
+  - lsb-release
+  - git
+  - jq
+  - htop
+  - tmux
+  - fail2ban
+  - ufw
+
+# Create boardroom user
+users:
+  - name: boardroom
+    groups: [docker, sudo]
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOGL5W/oL8iscTkUJ10MnSA8BKUIJbKCjcDOJqmuLjk0 brian@Brians-MacBook-Pro-M2-Max-64GB-2.local
+
+write_files:
+  # Docker daemon config
+  - path: /etc/docker/daemon.json
+    content: |
+      {
+        "log-driver": "json-file",
+        "log-opts": {
+          "max-size": "10m",
+          "max-file": "3"
+        },
+        "storage-driver": "overlay2"
+      }
+
+  # Boardroom directory structure
+  - path: /opt/boardroom/README.md
+    content: |
+      # Boardroom Server
+
+      ## Directory Structure
+      - /opt/boardroom/          - Main application directory
+      - /opt/boardroom/users/    - Per-user data and configs
+      - /opt/boardroom/shared/   - Shared configurations
+      - /mnt/data/               - Persistent volume mount
+
+      ## User Management
+      - Create user: /opt/boardroom/scripts/create-user.sh <username>
+      - Remove user: /opt/boardroom/scripts/remove-user.sh <username>
+      - List users:  /opt/boardroom/scripts/list-users.sh
+
+  # User creation script
+  - path: /opt/boardroom/scripts/create-user.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -e
+
+      USERNAME="$1"
+      if [ -z "$USERNAME" ]; then
+        echo "Usage: $0 <username>"
+        exit 1
+      fi
+
+      USER_DIR="/opt/boardroom/users/$USERNAME"
+      DATA_DIR="/mnt/data/users/$USERNAME"
+
+      if [ -d "$USER_DIR" ]; then
+        echo "User $USERNAME already exists"
+        exit 1
+      fi
+
+      echo "Creating user: $USERNAME"
+
+      # Create directories
+      mkdir -p "$USER_DIR"/{config,logs}
+      mkdir -p "$DATA_DIR"/{proxy-data,chat-history}
+
+      # Create docker-compose for this user
+      cat > "$USER_DIR/docker-compose.yml" << EOF
+      services:
+        console:
+          container_name: boardroom-${USERNAME}-console
+          image: ghcr.io/lemalogic/boardroom-console:latest
+          restart: unless-stopped
+          environment:
+            - NODE_ENV=production
+            - BOARDROOM_USER=${USERNAME}
+            - HTTP_PROXY=http://proxy:3128
+            - HTTPS_PROXY=http://proxy:3128
+            - NO_PROXY=localhost,127.0.0.1,proxy
+          volumes:
+            - ${DATA_DIR}/chat-history:/home/boardroom/.boardroom
+            - ${USER_DIR}/logs:/logs
+            - proxy-certs:/etc/boardroom-proxy-certs:ro
+          networks:
+            - ${USERNAME}-network
+          depends_on:
+            - proxy
+
+        proxy:
+          container_name: boardroom-${USERNAME}-proxy
+          image: ghcr.io/lemalogic/boardroom-proxy:latest
+          restart: unless-stopped
+          environment:
+            - PORT=8080
+            - PROXY_PORT=3128
+          volumes:
+            - ${DATA_DIR}/proxy-data:/data
+            - proxy-certs:/app/certs/.http-mitm-proxy
+          networks:
+            - ${USERNAME}-network
+
+      networks:
+        ${USERNAME}-network:
+          driver: bridge
+
+      volumes:
+        proxy-certs:
+      EOF
+
+      echo "User $USERNAME created at $USER_DIR"
+      echo "Start with: cd $USER_DIR && docker compose up -d"
+
+  # User removal script
+  - path: /opt/boardroom/scripts/remove-user.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -e
+
+      USERNAME="$1"
+      if [ -z "$USERNAME" ]; then
+        echo "Usage: $0 <username>"
+        exit 1
+      fi
+
+      USER_DIR="/opt/boardroom/users/$USERNAME"
+      DATA_DIR="/mnt/data/users/$USERNAME"
+
+      if [ ! -d "$USER_DIR" ]; then
+        echo "User $USERNAME does not exist"
+        exit 1
+      fi
+
+      echo "Stopping containers for $USERNAME..."
+      cd "$USER_DIR" && docker compose down 2>/dev/null || true
+
+      echo "Removing user directory..."
+      rm -rf "$USER_DIR"
+
+      echo "Data preserved at $DATA_DIR"
+      echo "To delete data: rm -rf $DATA_DIR"
+
+  # List users script
+  - path: /opt/boardroom/scripts/list-users.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      echo "Boardroom Users:"
+      echo "================"
+      for user_dir in /opt/boardroom/users/*/; do
+        username=$(basename "$user_dir")
+        status=$(cd "$user_dir" && docker compose ps --format "{{.Status}}" 2>/dev/null | head -1 || echo "stopped")
+        printf "%-20s %s\n" "$username" "$status"
+      done
+
+runcmd:
+  # Install Docker
+  - curl -fsSL https://get.docker.com | sh
+
+  # Add boardroom user to docker group
+  - usermod -aG docker boardroom
+
+  # Enable and start Docker
+  - systemctl enable docker
+  - systemctl start docker
+
+  # Install Docker Compose plugin
+  - apt-get install -y docker-compose-plugin
+
+  # Configure firewall
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw allow ssh
+  - ufw allow 80/tcp
+  - ufw allow 443/tcp
+  - ufw --force enable
+
+  # Create directory structure
+  - mkdir -p /opt/boardroom/{users,shared,scripts}
+  - mkdir -p /mnt/data/users
+
+  # Mount data volume (if attached)
+  - |
+    if [ -b /dev/sdb ]; then
+      mkdir -p /mnt/data
+      mount -o defaults /dev/sdb /mnt/data || true
+      echo '/dev/sdb /mnt/data ext4 defaults 0 2' >> /etc/fstab
+    fi
+
+  # Set permissions
+  - chown -R boardroom:boardroom /opt/boardroom
+  - chown -R boardroom:boardroom /mnt/data
+
+  # Install Cloudflare Tunnel (cloudflared)
+  - curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+  - dpkg -i cloudflared.deb
+  - rm cloudflared.deb
+
+  # Done
+  - echo "Boardroom server setup complete!" > /opt/boardroom/READY
+
+final_message: |
+  Boardroom server is ready!
+
+  Connect: ssh -i ~/.ssh/hetzer-boardroom boardroom@${public_ip}
+
+  Create user: /opt/boardroom/scripts/create-user.sh <username>
