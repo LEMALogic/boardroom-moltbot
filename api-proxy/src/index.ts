@@ -3,7 +3,10 @@ import { serve } from '@hono/node-server';
 import { logger } from 'hono/logger';
 import { cors } from 'hono/cors';
 import { timing } from 'hono/timing';
-import Proxy from 'http-mitm-proxy';
+// http-mitm-proxy is a CommonJS module - use createRequire for ESM compatibility
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const { Proxy: MitmProxy } = require('http-mitm-proxy');
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, watchFile } from 'fs';
@@ -12,83 +15,175 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 // =============================================================================
-// KEY STORAGE - Hot-reloadable from JSON file
+// KEY ALIAS STORE - Dynamic, no hardcoded providers
+// =============================================================================
+//
+// Each alias is a complete key configuration that can be looked up by name.
+// Multiple aliases can point to the same provider host (for different budgets/accounts).
+// Each host can have a designated default alias.
+//
+// Example aliases:
+//   "lema-openrouter-main" -> { host: "openrouter.ai", key: "sk-or-...", budget: "main" }
+//   "lema-openrouter-dev"  -> { host: "openrouter.ai", key: "sk-or-...", budget: "dev" }
+//   "lema-anthropic-brian" -> { host: "api.anthropic.com", key: "sk-ant-...", budget: "brian" }
+//
 // =============================================================================
 
 const DATA_DIR = process.env.DATA_DIR || '/data';
-const KEYS_FILE = join(DATA_DIR, 'api-keys.json');
+const ALIASES_FILE = join(DATA_DIR, 'key-aliases.json');
+const CONFIG_FILE = join(DATA_DIR, 'proxy-config.json');
 
-interface StoredProvider {
-  host: string;
-  name: string;
-  authHeader: string;
-  authPrefix?: string;  // e.g., "Bearer " for Authorization header
-  apiKey: string;
-  extraHeaders?: Record<string, string>;
-  enabled: boolean;
-  addedAt: string;
-  lastUsed?: string;
+// A key alias - complete configuration for one API key
+interface KeyAlias {
+  alias: string;              // Unique identifier (e.g., "lema-openrouter-main")
+  description: string;        // Human-readable description
+  host: string;               // API host to match (e.g., "openrouter.ai")
+  authHeader: string;         // Header name (e.g., "Authorization", "x-api-key")
+  authPrefix?: string;        // Optional prefix (e.g., "Bearer ")
+  extraHeaders?: Record<string, string>;  // Additional headers to inject
+  key: string;                // The actual API key
+  budget?: string;            // Budget group for cost tracking
+  enabled: boolean;           // Whether this alias is active
+  isDefault?: boolean;        // Whether this is the default for its host
+  addedAt: string;            // ISO timestamp when added
+  lastUsed?: string;          // ISO timestamp of last use
+  usageCount?: number;        // Number of times used
 }
 
-interface KeysStore {
-  providers: StoredProvider[];
+interface AliasStore {
+  aliases: KeyAlias[];
   version: number;
 }
 
-// =============================================================================
-// ADMIN CONFIG - Controls what services are allowed and usage limits
-// =============================================================================
+// Proxy configuration
+interface ProxyConfig {
+  // Global settings
+  globalDailyCap: number;           // Max USD per day across all aliases (0 = unlimited)
+  requireApproval: boolean;         // New aliases require admin approval
+  logRequests: boolean;             // Log all proxied requests
 
-interface AdminConfig {
-  // Which providers users are allowed to add keys for (empty = all allowed)
-  allowedServices: string[];
-  // Daily usage caps per provider (in USD, 0 = unlimited)
-  usageCaps: Record<string, number>;
-  // Global daily cap across all providers (0 = unlimited)
-  globalDailyCap: number;
-  // Whether to require admin approval for new keys
-  requireKeyApproval: boolean;
+  // Per-host defaults (which alias to use when no X-Key-Alias header)
+  hostDefaults: Record<string, string>;  // host -> alias name
 }
 
-const ADMIN_CONFIG_FILE = join(DATA_DIR, 'admin-config.json');
+// =============================================================================
+// STORE MANAGEMENT
+// =============================================================================
 
-let adminConfig: AdminConfig = {
-  allowedServices: [], // Empty = all providers allowed
-  usageCaps: {},
+let aliasStore: AliasStore = { aliases: [], version: 1 };
+let proxyConfig: ProxyConfig = {
   globalDailyCap: 0,
-  requireKeyApproval: false,
+  requireApproval: false,
+  logRequests: true,
+  hostDefaults: {},
 };
 
-function loadAdminConfig(): AdminConfig {
+function ensureDataDir() {
+  if (!existsSync(DATA_DIR)) {
+    mkdirSync(DATA_DIR, { recursive: true });
+  }
+}
+
+function loadAliasStore(): AliasStore {
   ensureDataDir();
-  if (existsSync(ADMIN_CONFIG_FILE)) {
+  if (existsSync(ALIASES_FILE)) {
     try {
-      return JSON.parse(readFileSync(ADMIN_CONFIG_FILE, 'utf-8'));
+      const data = readFileSync(ALIASES_FILE, 'utf-8');
+      const store = JSON.parse(data) as AliasStore;
+      console.log(`[ALIASES] Loaded ${store.aliases.filter(a => a.enabled).length} active aliases from ${ALIASES_FILE}`);
+      return store;
     } catch (err) {
-      console.error('[ADMIN] Error loading config:', err);
+      console.error(`[ALIASES] Error loading aliases:`, err);
     }
   }
-  return adminConfig;
+  return { aliases: [], version: 1 };
 }
 
-function saveAdminConfig(config: AdminConfig) {
+function saveAliasStore(store: AliasStore) {
   ensureDataDir();
-  writeFileSync(ADMIN_CONFIG_FILE, JSON.stringify(config, null, 2));
-  console.log('[ADMIN] Saved config to', ADMIN_CONFIG_FILE);
+  try {
+    writeFileSync(ALIASES_FILE, JSON.stringify(store, null, 2));
+    console.log(`[ALIASES] Saved ${store.aliases.length} aliases to ${ALIASES_FILE}`);
+  } catch (err) {
+    console.error(`[ALIASES] Error saving aliases:`, err);
+  }
 }
 
-adminConfig = loadAdminConfig();
+function loadProxyConfig(): ProxyConfig {
+  ensureDataDir();
+  if (existsSync(CONFIG_FILE)) {
+    try {
+      return JSON.parse(readFileSync(CONFIG_FILE, 'utf-8'));
+    } catch (err) {
+      console.error('[CONFIG] Error loading config:', err);
+    }
+  }
+  return proxyConfig;
+}
 
-// Watch for config changes
-if (existsSync(ADMIN_CONFIG_FILE)) {
-  watchFile(ADMIN_CONFIG_FILE, { interval: 1000 }, () => {
-    console.log('[ADMIN] Detected config changes, reloading...');
-    adminConfig = loadAdminConfig();
+function saveProxyConfig(config: ProxyConfig) {
+  ensureDataDir();
+  writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+  console.log('[CONFIG] Saved config to', CONFIG_FILE);
+}
+
+// Load on startup
+aliasStore = loadAliasStore();
+proxyConfig = loadProxyConfig();
+
+// Watch for file changes and hot-reload
+if (existsSync(ALIASES_FILE)) {
+  watchFile(ALIASES_FILE, { interval: 1000 }, () => {
+    console.log(`[ALIASES] Detected changes, reloading...`);
+    aliasStore = loadAliasStore();
+  });
+}
+
+if (existsSync(CONFIG_FILE)) {
+  watchFile(CONFIG_FILE, { interval: 1000 }, () => {
+    console.log(`[CONFIG] Detected changes, reloading...`);
+    proxyConfig = loadProxyConfig();
   });
 }
 
 // =============================================================================
-// KEY REDACTION PATTERNS - For chat log sanitization
+// ALIAS LOOKUP
+// =============================================================================
+
+// Get alias by name
+function getAliasByName(name: string): KeyAlias | undefined {
+  return aliasStore.aliases.find(a => a.alias === name && a.enabled);
+}
+
+// Get default alias for a host
+function getDefaultAliasForHost(host: string): KeyAlias | undefined {
+  // First check explicit default in config
+  const defaultName = proxyConfig.hostDefaults[host];
+  if (defaultName) {
+    const alias = getAliasByName(defaultName);
+    if (alias) return alias;
+  }
+
+  // Fall back to first enabled alias for this host marked as default
+  const defaultAlias = aliasStore.aliases.find(a => a.host === host && a.enabled && a.isDefault);
+  if (defaultAlias) return defaultAlias;
+
+  // Fall back to first enabled alias for this host
+  return aliasStore.aliases.find(a => a.host === host && a.enabled);
+}
+
+// Get all aliases for a host (exported for potential external use)
+export function getAliasesForHost(host: string): KeyAlias[] {
+  return aliasStore.aliases.filter(a => a.host === host);
+}
+
+// Get all unique hosts
+function getUniqueHosts(): string[] {
+  return [...new Set(aliasStore.aliases.map(a => a.host))];
+}
+
+// =============================================================================
+// KEY REDACTION PATTERNS
 // =============================================================================
 
 const API_KEY_PATTERNS: { name: string; pattern: RegExp }[] = [
@@ -99,7 +194,6 @@ const API_KEY_PATTERNS: { name: string; pattern: RegExp }[] = [
   { name: 'Google AI', pattern: /AIza[A-Za-z0-9_-]{35}/g },
   { name: 'Replicate', pattern: /r8_[A-Za-z0-9]{37}/g },
   { name: 'Hugging Face', pattern: /hf_[A-Za-z0-9]{34}/g },
-  { name: 'Cohere', pattern: /[A-Za-z0-9]{40}(?=.*cohere)/gi },
   { name: 'Generic Long Key', pattern: /(?:key|token|secret|api[_-]?key)\s*[:=]\s*['"]?([A-Za-z0-9_-]{20,})['"]?/gi },
 ];
 
@@ -120,217 +214,45 @@ function redactApiKeys(text: string): { redacted: string; found: string[] } {
   return { redacted, found };
 }
 
-// Default provider templates (no keys - just the config structure)
-const PROVIDER_TEMPLATES: Omit<StoredProvider, 'apiKey' | 'enabled' | 'addedAt'>[] = [
-  { host: 'api.anthropic.com', name: 'Anthropic', authHeader: 'x-api-key', extraHeaders: { 'anthropic-version': '2023-06-01' } },
-  { host: 'api.openai.com', name: 'OpenAI', authHeader: 'Authorization', authPrefix: 'Bearer ' },
-  { host: 'generativelanguage.googleapis.com', name: 'Google AI', authHeader: 'x-goog-api-key' },
-  { host: 'api.mistral.ai', name: 'Mistral', authHeader: 'Authorization', authPrefix: 'Bearer ' },
-  { host: 'api.cohere.ai', name: 'Cohere', authHeader: 'Authorization', authPrefix: 'Bearer ' },
-  { host: 'api.groq.com', name: 'Groq', authHeader: 'Authorization', authPrefix: 'Bearer ' },
-  { host: 'api.perplexity.ai', name: 'Perplexity', authHeader: 'Authorization', authPrefix: 'Bearer ' },
-  { host: 'api.together.xyz', name: 'Together AI', authHeader: 'Authorization', authPrefix: 'Bearer ' },
-  { host: 'api.fireworks.ai', name: 'Fireworks', authHeader: 'Authorization', authPrefix: 'Bearer ' },
-  { host: 'api-inference.huggingface.co', name: 'Hugging Face', authHeader: 'Authorization', authPrefix: 'Bearer ' },
-  { host: 'api.replicate.com', name: 'Replicate', authHeader: 'Authorization', authPrefix: 'Bearer ' },
-  { host: 'api.ideogram.ai', name: 'Ideogram', authHeader: 'Api-Key' },
-  { host: 'api.stability.ai', name: 'Stability AI', authHeader: 'Authorization', authPrefix: 'Bearer ' },
-  { host: 'api.elevenlabs.io', name: 'ElevenLabs', authHeader: 'xi-api-key' },
-  { host: 'api.retellai.com', name: 'Retell AI', authHeader: 'Authorization', authPrefix: 'Bearer ' },
-  { host: 'api.resend.com', name: 'Resend', authHeader: 'Authorization', authPrefix: 'Bearer ' },
-];
+// =============================================================================
+// COST TRACKING
+// =============================================================================
 
-// In-memory store (loaded from file, hot-reloaded on changes)
-let keysStore: KeysStore = { providers: [], version: 1 };
-
-function ensureDataDir() {
-  if (!existsSync(DATA_DIR)) {
-    mkdirSync(DATA_DIR, { recursive: true });
-  }
-}
-
-function loadKeysFromFile(): KeysStore {
-  ensureDataDir();
-
-  if (existsSync(KEYS_FILE)) {
-    try {
-      const data = readFileSync(KEYS_FILE, 'utf-8');
-      const store = JSON.parse(data) as KeysStore;
-      console.log(`[KEYS] Loaded ${store.providers.filter(p => p.enabled).length} active providers from ${KEYS_FILE}`);
-      return store;
-    } catch (err) {
-      console.error(`[KEYS] Error loading keys file:`, err);
-    }
-  }
-
-  // Initialize from environment variables if no file exists
-  return initializeFromEnv();
-}
-
-function initializeFromEnv(): KeysStore {
-  const envMapping: Record<string, string> = {
-    'api.anthropic.com': 'ANTHROPIC_API_KEY',
-    'api.openai.com': 'OPENAI_API_KEY',
-    'generativelanguage.googleapis.com': 'GOOGLE_AI_API_KEY',
-    'api.mistral.ai': 'MISTRAL_API_KEY',
-    'api.cohere.ai': 'COHERE_API_KEY',
-    'api.groq.com': 'GROQ_API_KEY',
-    'api.perplexity.ai': 'PERPLEXITY_API_KEY',
-    'api.together.xyz': 'TOGETHER_API_KEY',
-    'api.fireworks.ai': 'FIREWORKS_API_KEY',
-    'api-inference.huggingface.co': 'HUGGINGFACE_API_KEY',
-    'api.replicate.com': 'REPLICATE_API_TOKEN',
-    'api.ideogram.ai': 'IDEOGRAM_API_KEY',
-    'api.stability.ai': 'STABILITY_API_KEY',
-    'api.elevenlabs.io': 'ELEVENLABS_API_KEY',
-    'api.retellai.com': 'RETELL_API_KEY',
-    'api.resend.com': 'RESEND_API_KEY',
-  };
-
-  const providers: StoredProvider[] = PROVIDER_TEMPLATES.map(template => {
-    const envVar = envMapping[template.host];
-    const apiKey = envVar ? process.env[envVar] || '' : '';
-    return {
-      ...template,
-      apiKey,
-      enabled: !!apiKey,
-      addedAt: new Date().toISOString(),
-    };
-  });
-
-  const store: KeysStore = { providers, version: 1 };
-
-  // Save to file for future use
-  saveKeysToFile(store);
-
-  return store;
-}
-
-function saveKeysToFile(store: KeysStore) {
-  ensureDataDir();
-  try {
-    writeFileSync(KEYS_FILE, JSON.stringify(store, null, 2));
-    console.log(`[KEYS] Saved ${store.providers.length} providers to ${KEYS_FILE}`);
-  } catch (err) {
-    console.error(`[KEYS] Error saving keys file:`, err);
-  }
-}
-
-function getActiveProviders(): Map<string, StoredProvider> {
-  const map = new Map<string, StoredProvider>();
-  for (const provider of keysStore.providers) {
-    if (provider.enabled && provider.apiKey) {
-      map.set(provider.host, provider);
-    }
-  }
-  return map;
-}
-
-// Load keys on startup
-keysStore = loadKeysFromFile();
-
-// Watch for file changes and hot-reload
-if (existsSync(KEYS_FILE)) {
-  watchFile(KEYS_FILE, { interval: 1000 }, () => {
-    console.log(`[KEYS] Detected changes to ${KEYS_FILE}, reloading...`);
-    keysStore = loadKeysFromFile();
-  });
-}
-
-// Types
-interface CostTrackingData {
+interface CostEntry {
   timestamp: string;
-  provider: 'anthropic' | 'openai';
+  alias: string;
+  host: string;
   path: string;
   method: string;
   inputTokens?: number;
   outputTokens?: number;
   model?: string;
   estimatedCost?: number;
-  clientId?: string;
+  budget?: string;
 }
 
-interface ProxyConfig {
-  anthropicApiKey: string;
-  openaiApiKey: string;
-  port: number;
-  proxyPort: number;
-}
+const costLog: CostEntry[] = [];
 
-// Configuration
-const config: ProxyConfig = {
-  anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
-  openaiApiKey: process.env.OPENAI_API_KEY || '',
-  port: parseInt(process.env.PORT || '8080', 10),
-  proxyPort: parseInt(process.env.PROXY_PORT || '3128', 10),
-};
-
-// Ensure certs directory exists
-const certsDir = join(__dirname, '..', 'certs', '.http-mitm-proxy');
-if (!existsSync(certsDir)) {
-  mkdirSync(certsDir, { recursive: true });
-}
-
-// Cost tracking storage (in-memory for now, would be replaced with DB)
-const costLog: CostTrackingData[] = [];
-
-// Log configured providers at startup
-const activeProviders = getActiveProviders();
-console.log(`[CONFIG] Active API providers: ${Array.from(activeProviders.keys()).join(', ') || 'none'}`);
-
-
-// Utility: Strip API keys from headers for logging (exported for potential use in logging middleware)
-export function sanitizeHeaders(headers: Headers | Record<string, string>): Record<string, string> {
-  const sanitized: Record<string, string> = {};
-  const entries = headers instanceof Headers
-    ? Array.from(headers.entries())
-    : Object.entries(headers);
-
-  for (const [key, value] of entries) {
-    const lowerKey = key.toLowerCase();
-    if (
-      lowerKey.includes('authorization') ||
-      lowerKey.includes('api-key') ||
-      lowerKey.includes('x-api-key')
-    ) {
-      sanitized[key] = '[REDACTED]';
-    } else {
-      sanitized[key] = value;
-    }
-  }
-  return sanitized;
-}
-
-// Utility: Estimate cost based on token usage
-function estimateCost(
-  provider: 'anthropic' | 'openai',
-  model: string | undefined,
-  inputTokens: number,
-  outputTokens: number
-): number {
-  const anthropicRates: Record<string, { input: number; output: number }> = {
+function estimateCost(_host: string, model: string | undefined, inputTokens: number, outputTokens: number): number {
+  // Dynamic rate lookup - could be extended to store rates per alias
+  const rates: Record<string, { input: number; output: number }> = {
+    'claude-opus-4': { input: 15, output: 75 },
+    'claude-sonnet-4': { input: 3, output: 15 },
     'claude-3-opus': { input: 15, output: 75 },
     'claude-3-sonnet': { input: 3, output: 15 },
     'claude-3-haiku': { input: 0.25, output: 1.25 },
-    'claude-3-5-sonnet': { input: 3, output: 15 },
-  };
-
-  const openaiRates: Record<string, { input: number; output: number }> = {
     'gpt-4-turbo': { input: 10, output: 30 },
-    'gpt-4': { input: 30, output: 60 },
-    'gpt-3.5-turbo': { input: 0.5, output: 1.5 },
     'gpt-4o': { input: 5, output: 15 },
+    'gpt-4': { input: 30, output: 60 },
+    'gpt-3.5': { input: 0.5, output: 1.5 },
   };
 
-  const rates = provider === 'anthropic' ? anthropicRates : openaiRates;
-  const defaultRate = provider === 'anthropic'
-    ? { input: 3, output: 15 }
-    : { input: 5, output: 15 };
-
+  const defaultRate = { input: 5, output: 15 };
   let rate = defaultRate;
+
   if (model) {
     for (const [key, value] of Object.entries(rates)) {
-      if (model.includes(key)) {
+      if (model.toLowerCase().includes(key.toLowerCase())) {
         rate = value;
         break;
       }
@@ -340,19 +262,14 @@ function estimateCost(
   return (inputTokens * rate.input + outputTokens * rate.output) / 1_000_000;
 }
 
-// Cost tracking middleware
-const trackCost = async (
-  provider: 'anthropic' | 'openai',
-  path: string,
-  method: string,
-  requestBody: unknown,
-  responseBody: unknown
-) => {
-  const entry: CostTrackingData = {
+function trackCost(alias: KeyAlias, path: string, method: string, responseBody: unknown) {
+  const entry: CostEntry = {
     timestamp: new Date().toISOString(),
-    provider,
+    alias: alias.alias,
+    host: alias.host,
     path,
     method,
+    budget: alias.budget,
   };
 
   if (responseBody && typeof responseBody === 'object') {
@@ -364,33 +281,40 @@ const trackCost = async (
       entry.outputTokens = usage.output_tokens || usage.completion_tokens;
     }
 
-    if (requestBody && typeof requestBody === 'object') {
-      const req = requestBody as Record<string, unknown>;
-      entry.model = req.model as string | undefined;
-    }
     if (resp.model) {
       entry.model = resp.model as string;
     }
   }
 
   if (entry.inputTokens && entry.outputTokens) {
-    entry.estimatedCost = estimateCost(
-      provider,
-      entry.model,
-      entry.inputTokens,
-      entry.outputTokens
-    );
+    entry.estimatedCost = estimateCost(alias.host, entry.model, entry.inputTokens, entry.outputTokens);
   }
 
   costLog.push(entry);
 
+  // Keep last 10000 entries
   if (costLog.length > 10000) {
     costLog.splice(0, costLog.length - 10000);
   }
-};
+}
 
 // =============================================================================
-// HONO APP - Direct API endpoints and admin UI
+// CONFIGURATION
+// =============================================================================
+
+const serverConfig = {
+  port: parseInt(process.env.PORT || '8080', 10),
+  proxyPort: parseInt(process.env.PROXY_PORT || '3128', 10),
+};
+
+// Ensure certs directory exists
+const certsDir = join(__dirname, '..', 'certs', '.http-mitm-proxy');
+if (!existsSync(certsDir)) {
+  mkdirSync(certsDir, { recursive: true });
+}
+
+// =============================================================================
+// HONO APP - Admin UI and API
 // =============================================================================
 
 const app = new Hono();
@@ -401,19 +325,34 @@ app.use('*', logger());
 
 // Health check
 app.get('/health', (c) => {
+  const activeAliases = aliasStore.aliases.filter(a => a.enabled);
+  const hosts = getUniqueHosts();
+
   return c.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
-    hasAnthropicKey: !!config.anthropicApiKey,
-    hasOpenaiKey: !!config.openaiApiKey,
+    activeAliases: activeAliases.length,
+    totalAliases: aliasStore.aliases.length,
+    hosts: hosts.length,
   });
 });
 
-// Admin UI - Full key management interface
+// Admin UI
 app.get('/admin', (c) => {
-  const providers = keysStore.providers;
-  const activeCount = providers.filter(p => p.enabled && p.apiKey).length;
+  const aliases = aliasStore.aliases;
+  const activeCount = aliases.filter(a => a.enabled).length;
+  const hosts = getUniqueHosts();
+  const totalCost = costLog.reduce((sum, e) => sum + (e.estimatedCost || 0), 0);
+
+  // Group aliases by host for display
+  const aliasesByHost: Record<string, KeyAlias[]> = {};
+  for (const alias of aliases) {
+    if (!aliasesByHost[alias.host]) {
+      aliasesByHost[alias.host] = [];
+    }
+    aliasesByHost[alias.host].push(alias);
+  }
 
   return c.html(`
     <!DOCTYPE html>
@@ -422,26 +361,26 @@ app.get('/admin', (c) => {
       <title>Boardroom API Proxy - Admin</title>
       <style>
         * { box-sizing: border-box; }
-        body { font-family: system-ui, sans-serif; max-width: 1000px; margin: 0 auto; padding: 20px; background: #0a0a0a; color: #e0e0e0; }
+        body { font-family: system-ui, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; background: #0a0a0a; color: #e0e0e0; }
         h1 { color: #fff; margin-bottom: 5px; }
         .subtitle { color: #888; margin-bottom: 30px; }
         .card { background: #1a1a1a; padding: 20px; border-radius: 8px; margin: 20px 0; border: 1px solid #333; }
         .card h2 { margin-top: 0; color: #fff; display: flex; align-items: center; gap: 10px; }
         .badge { background: #333; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: normal; }
         .badge.active { background: #1a3d1a; color: #4ade80; }
+        .badge.default { background: #1a3d3d; color: #4adede; }
         table { width: 100%; border-collapse: collapse; }
         th { text-align: left; padding: 12px; border-bottom: 2px solid #333; color: #888; font-weight: 500; }
         td { padding: 12px; border-bottom: 1px solid #222; }
         .status { display: inline-block; padding: 4px 12px; border-radius: 4px; font-weight: 500; font-size: 12px; }
         .status.active { background: #1a3d1a; color: #4ade80; }
-        .status.inactive { background: #3d3d1a; color: #facc15; }
-        .status.missing { background: #2d2d2d; color: #888; }
+        .status.inactive { background: #3d1a1a; color: #fa5c5c; }
         code { background: #333; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
-        input[type="text"], input[type="password"] {
+        input[type="text"], input[type="password"], select {
           background: #222; border: 1px solid #444; color: #fff; padding: 8px 12px;
           border-radius: 4px; width: 100%; font-family: monospace;
         }
-        input:focus { outline: none; border-color: #667eea; }
+        input:focus, select:focus { outline: none; border-color: #667eea; }
         button {
           background: #667eea; color: #fff; border: none; padding: 8px 16px;
           border-radius: 4px; cursor: pointer; font-weight: 500;
@@ -452,33 +391,27 @@ app.get('/admin', (c) => {
         button.danger { background: #dc2626; }
         button.danger:hover { background: #b91c1c; }
         .actions { display: flex; gap: 8px; }
-        .key-input { display: flex; gap: 8px; align-items: center; }
-        .key-input input { flex: 1; }
-        .toggle {
-          width: 44px; height: 24px; background: #333; border-radius: 12px;
-          position: relative; cursor: pointer; transition: background 0.2s;
-        }
-        .toggle.on { background: #4ade80; }
-        .toggle::after {
-          content: ''; position: absolute; width: 20px; height: 20px;
-          background: #fff; border-radius: 50%; top: 2px; left: 2px;
-          transition: left 0.2s;
-        }
-        .toggle.on::after { left: 22px; }
-        .warning { background: #3d2a1a; border: 1px solid #f59e0b; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
-        .warning h3 { color: #f59e0b; margin: 0 0 10px 0; font-size: 14px; }
-        .warning p { margin: 0; font-size: 13px; color: #d4a574; }
-        .stats { display: flex; gap: 20px; margin-bottom: 20px; }
-        .stat { background: #16213e; padding: 15px 25px; border-radius: 8px; text-align: center; }
+        .stats { display: flex; gap: 20px; margin-bottom: 20px; flex-wrap: wrap; }
+        .stat { background: #16213e; padding: 15px 25px; border-radius: 8px; text-align: center; min-width: 120px; }
         .stat .number { font-size: 28px; font-weight: bold; color: #667eea; }
         .stat .label { font-size: 12px; color: #888; margin-top: 5px; }
         a { color: #60a5fa; }
         .masked { font-family: monospace; color: #888; }
+        .host-section { margin-top: 30px; }
+        .host-header { background: #252525; padding: 10px 15px; border-radius: 8px 8px 0 0; border: 1px solid #333; border-bottom: none; }
+        .host-header h3 { margin: 0; color: #fff; font-size: 16px; }
+        .host-table { border: 1px solid #333; border-radius: 0 0 8px 8px; overflow: hidden; }
+        .form-row { display: flex; gap: 10px; margin-bottom: 10px; }
+        .form-row > * { flex: 1; }
+        .form-row label { display: block; font-size: 12px; color: #888; margin-bottom: 4px; }
+        .warning { background: #3d2a1a; border: 1px solid #f59e0b; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
+        .warning h3 { color: #f59e0b; margin: 0 0 10px 0; font-size: 14px; }
+        .warning p { margin: 0; font-size: 13px; color: #d4a574; }
       </style>
     </head>
     <body>
-      <h1>🏢 Boardroom API Proxy</h1>
-      <p class="subtitle">API Key Management Console</p>
+      <h1>🔑 Boardroom API Proxy</h1>
+      <p class="subtitle">Key Alias Management Console</p>
 
       <div class="warning">
         <h3>⚠️ Compliance Notice</h3>
@@ -490,198 +423,217 @@ app.get('/admin', (c) => {
       <div class="stats">
         <div class="stat">
           <div class="number">${activeCount}</div>
-          <div class="label">Active Providers</div>
+          <div class="label">Active Aliases</div>
         </div>
         <div class="stat">
-          <div class="number">${providers.length}</div>
-          <div class="label">Total Configured</div>
+          <div class="number">${hosts.length}</div>
+          <div class="label">Unique Hosts</div>
         </div>
         <div class="stat">
           <div class="number">${costLog.length}</div>
           <div class="label">Requests Logged</div>
         </div>
         <div class="stat">
-          <div class="number">$${costLog.reduce((sum, e) => sum + (e.estimatedCost || 0), 0).toFixed(2)}</div>
+          <div class="number">$${totalCost.toFixed(2)}</div>
           <div class="label">Est. Total Cost</div>
         </div>
       </div>
 
       <div class="card">
-        <h2>API Providers <span class="badge active">${activeCount} active</span></h2>
-        <table>
-          <thead>
-            <tr>
-              <th>Provider</th>
-              <th>Host</th>
-              <th>API Key</th>
-              <th>Status</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${providers.map((p, i) => `
-              <tr data-index="${i}">
-                <td><strong>${p.name}</strong></td>
-                <td><code>${p.host}</code></td>
-                <td>
-                  <span class="masked">${p.apiKey ? p.apiKey.substring(0, 8) + '...' + p.apiKey.slice(-4) : '(not set)'}</span>
-                </td>
-                <td>
-                  <span class="status ${p.enabled && p.apiKey ? 'active' : p.apiKey ? 'inactive' : 'missing'}">
-                    ${p.enabled && p.apiKey ? '✓ Active' : p.apiKey ? '⏸ Disabled' : '○ No Key'}
-                  </span>
-                </td>
-                <td class="actions">
-                  <button class="secondary" onclick="editKey(${i})">Edit</button>
-                  <button class="secondary" onclick="toggleEnabled(${i})">${p.enabled ? 'Disable' : 'Enable'}</button>
-                </td>
-              </tr>
-            `).join('')}
-          </tbody>
-        </table>
+        <h2>Add New Alias</h2>
+        <form id="add-alias-form">
+          <div class="form-row">
+            <div>
+              <label>Alias Name</label>
+              <input type="text" name="alias" placeholder="e.g., lema-openrouter-main" required>
+            </div>
+            <div>
+              <label>Description</label>
+              <input type="text" name="description" placeholder="e.g., Main OpenRouter account for LEMA">
+            </div>
+          </div>
+          <div class="form-row">
+            <div>
+              <label>API Host</label>
+              <input type="text" name="host" placeholder="e.g., openrouter.ai, api.anthropic.com" required>
+            </div>
+            <div>
+              <label>Auth Header</label>
+              <input type="text" name="authHeader" placeholder="e.g., Authorization, x-api-key" required>
+            </div>
+          </div>
+          <div class="form-row">
+            <div>
+              <label>Auth Prefix (optional)</label>
+              <input type="text" name="authPrefix" placeholder="e.g., Bearer ">
+            </div>
+            <div>
+              <label>Budget Group (optional)</label>
+              <input type="text" name="budget" placeholder="e.g., main, dev, brian-personal">
+            </div>
+          </div>
+          <div class="form-row">
+            <div>
+              <label>API Key</label>
+              <input type="password" name="key" placeholder="sk-..." required>
+            </div>
+            <div>
+              <label>Extra Headers (JSON, optional)</label>
+              <input type="text" name="extraHeaders" placeholder='{"anthropic-version": "2023-06-01"}'>
+            </div>
+          </div>
+          <div class="form-row">
+            <div style="flex: none;">
+              <label>&nbsp;</label>
+              <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                <input type="checkbox" name="isDefault" style="width: 18px; height: 18px;">
+                <span>Set as default for this host</span>
+              </label>
+            </div>
+            <div style="flex: none; margin-left: auto;">
+              <label>&nbsp;</label>
+              <button type="submit">Add Alias</button>
+            </div>
+          </div>
+        </form>
+      </div>
+
+      <div class="card">
+        <h2>Key Aliases <span class="badge active">${activeCount} active</span></h2>
+
+        ${hosts.length === 0 ? `
+          <p style="color: #888; text-align: center; padding: 40px;">
+            No aliases configured yet. Add your first alias above.
+          </p>
+        ` : hosts.map(host => `
+          <div class="host-section">
+            <div class="host-header">
+              <h3><code>${host}</code> ${proxyConfig.hostDefaults[host] ? `<span class="badge default">default: ${proxyConfig.hostDefaults[host]}</span>` : ''}</h3>
+            </div>
+            <table class="host-table">
+              <thead>
+                <tr>
+                  <th>Alias</th>
+                  <th>Description</th>
+                  <th>Budget</th>
+                  <th>Key</th>
+                  <th>Status</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${aliasesByHost[host].map(a => `
+                  <tr data-alias="${a.alias}">
+                    <td>
+                      <strong>${a.alias}</strong>
+                      ${a.isDefault ? '<span class="badge default" style="margin-left:8px;">default</span>' : ''}
+                    </td>
+                    <td style="color:#888;">${a.description || '-'}</td>
+                    <td><code>${a.budget || 'none'}</code></td>
+                    <td><span class="masked">${a.key ? a.key.substring(0, 8) + '...' + a.key.slice(-4) : '(not set)'}</span></td>
+                    <td>
+                      <span class="status ${a.enabled ? 'active' : 'inactive'}">
+                        ${a.enabled ? '✓ Active' : '✗ Disabled'}
+                      </span>
+                    </td>
+                    <td class="actions">
+                      <button class="secondary" onclick="editAlias('${a.alias}')">Edit</button>
+                      <button class="secondary" onclick="toggleAlias('${a.alias}')">${a.enabled ? 'Disable' : 'Enable'}</button>
+                      <button class="secondary" onclick="setDefault('${a.alias}', '${host}')">Set Default</button>
+                      <button class="danger" onclick="deleteAlias('${a.alias}')">Delete</button>
+                    </td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        `).join('')}
       </div>
 
       <div class="card">
         <h2>Proxy Configuration</h2>
         <table>
-          <tr><td>Admin Port</td><td><code>${config.port}</code></td></tr>
-          <tr><td>MITM Proxy Port</td><td><code>${config.proxyPort}</code></td></tr>
-          <tr><td>Keys File</td><td><code>${KEYS_FILE}</code></td></tr>
-          <tr><td>Console Config</td><td><code>HTTP_PROXY=http://proxy:${config.proxyPort}</code></td></tr>
+          <tr><td>Admin Port</td><td><code>${serverConfig.port}</code></td></tr>
+          <tr><td>MITM Proxy Port</td><td><code>${serverConfig.proxyPort}</code></td></tr>
+          <tr><td>Aliases File</td><td><code>${ALIASES_FILE}</code></td></tr>
+          <tr><td>Console Env</td><td><code>HTTPS_PROXY=http://proxy:${serverConfig.proxyPort}</code></td></tr>
+          <tr><td>Alias Header</td><td><code>X-Key-Alias: &lt;alias-name&gt;</code></td></tr>
         </table>
       </div>
 
       <div class="card">
-        <h2>Cost Tracking</h2>
+        <h2>Cost Tracking by Budget</h2>
         <p><a href="/admin/costs">View detailed cost data (JSON)</a></p>
+        <p><a href="/admin/costs/by-budget">View costs grouped by budget (JSON)</a></p>
       </div>
 
       <div class="card">
-        <h2>Admin Controls</h2>
-        <p style="color:#888; margin-bottom:15px;">Configure which services users can add and usage limits.</p>
-
-        <div style="margin-bottom:20px;">
-          <label style="display:block; margin-bottom:5px; color:#888;">Allowed Services (comma-separated, empty = all)</label>
-          <input type="text" id="allowed-services" value="${adminConfig.allowedServices.join(', ')}"
-            placeholder="e.g., anthropic, openai, google" style="margin-bottom:10px;">
-          <p style="font-size:12px; color:#666;">Only these providers can have keys added via console chat.</p>
-        </div>
-
-        <div style="margin-bottom:20px;">
-          <label style="display:block; margin-bottom:5px; color:#888;">Global Daily Cap (USD, 0 = unlimited)</label>
-          <input type="number" id="global-cap" value="${adminConfig.globalDailyCap}" min="0" step="1"
-            style="width:150px;">
-        </div>
-
-        <div style="margin-bottom:20px;">
-          <label style="display:flex; align-items:center; gap:10px; cursor:pointer;">
-            <input type="checkbox" id="require-approval" ${adminConfig.requireKeyApproval ? 'checked' : ''}
-              style="width:18px; height:18px;">
-            <span>Require admin approval for new keys</span>
-          </label>
-          <p style="font-size:12px; color:#666; margin-top:5px;">Keys added via console will be disabled until approved in this UI.</p>
-        </div>
-
-        <button onclick="saveConfig()">Save Admin Config</button>
-      </div>
-
-      <div class="card">
-        <h2>Console API Reference</h2>
-        <p style="color:#888; margin-bottom:15px;">Endpoints for console chat key management:</p>
+        <h2>API Reference</h2>
         <table>
-          <tr><td><code>POST /v1/keys/:provider</code></td><td>Add key: <code>{"key": "sk-..."}</code></td></tr>
-          <tr><td><code>DELETE /v1/keys/:provider</code></td><td>Remove key for provider</td></tr>
-          <tr><td><code>GET /v1/keys</code></td><td>List all providers and key status</td></tr>
-          <tr><td><code>POST /v1/redact</code></td><td>Redact keys from text: <code>{"text": "..."}</code></td></tr>
+          <tr><td><code>GET /v1/aliases</code></td><td>List all aliases (keys redacted)</td></tr>
+          <tr><td><code>POST /v1/aliases</code></td><td>Add new alias</td></tr>
+          <tr><td><code>PUT /v1/aliases/:alias</code></td><td>Update alias</td></tr>
+          <tr><td><code>DELETE /v1/aliases/:alias</code></td><td>Delete alias</td></tr>
+          <tr><td><code>POST /v1/aliases/:alias/toggle</code></td><td>Enable/disable alias</td></tr>
+          <tr><td><code>POST /v1/redact</code></td><td>Redact API keys from text</td></tr>
         </table>
-        <p style="margin-top:15px; font-size:13px; color:#888;">
-          Example: User types "Add my Anthropic key sk-ant-..." → Console calls <code>POST /v1/keys/anthropic</code>
-          → Immediately redacts key in chat display
-        </p>
-      </div>
-
-      <!-- Edit Modal -->
-      <div id="modal" style="display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.8); z-index:1000; justify-content:center; align-items:center;">
-        <div style="background:#1a1a1a; padding:30px; border-radius:8px; width:500px; border:1px solid #333;">
-          <h3 style="margin-top:0; color:#fff;">Edit API Key</h3>
-          <p id="modal-provider" style="color:#888;"></p>
-          <div class="key-input" style="margin: 20px 0;">
-            <input type="password" id="modal-key" placeholder="Enter API key...">
-            <button class="secondary" onclick="toggleKeyVisibility()">Show</button>
-          </div>
-          <div style="display:flex; gap:10px; justify-content:flex-end;">
-            <button class="secondary" onclick="closeModal()">Cancel</button>
-            <button onclick="saveKey()">Save Key</button>
-          </div>
-        </div>
       </div>
 
       <script>
-        let editingIndex = -1;
+        const aliases = ${JSON.stringify(aliases.map(a => ({ ...a, key: a.key ? a.key.substring(0, 8) + '...' : '' })))};
 
-        function editKey(index) {
-          editingIndex = index;
-          const provider = ${JSON.stringify(providers)}[index];
-          document.getElementById('modal-provider').textContent = provider.name + ' (' + provider.host + ')';
-          document.getElementById('modal-key').value = provider.apiKey || '';
-          document.getElementById('modal').style.display = 'flex';
-        }
-
-        function closeModal() {
-          document.getElementById('modal').style.display = 'none';
-          editingIndex = -1;
-        }
-
-        function toggleKeyVisibility() {
-          const input = document.getElementById('modal-key');
-          input.type = input.type === 'password' ? 'text' : 'password';
-        }
-
-        async function saveKey() {
-          const apiKey = document.getElementById('modal-key').value;
-          const res = await fetch('/admin/api/keys/' + editingIndex, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ apiKey })
-          });
-          if (res.ok) {
-            location.reload();
-          } else {
-            alert('Failed to save key');
-          }
-        }
-
-        async function toggleEnabled(index) {
-          const res = await fetch('/admin/api/keys/' + index + '/toggle', { method: 'POST' });
-          if (res.ok) {
-            location.reload();
-          }
-        }
-
-        async function saveConfig() {
-          const allowedRaw = document.getElementById('allowed-services').value;
-          const allowedServices = allowedRaw.trim()
-            ? allowedRaw.split(',').map(s => s.trim()).filter(s => s)
-            : [];
-
-          const config = {
-            allowedServices,
-            globalDailyCap: parseFloat(document.getElementById('global-cap').value) || 0,
-            requireKeyApproval: document.getElementById('require-approval').checked,
+        document.getElementById('add-alias-form').addEventListener('submit', async (e) => {
+          e.preventDefault();
+          const form = e.target;
+          const data = {
+            alias: form.alias.value,
+            description: form.description.value,
+            host: form.host.value,
+            authHeader: form.authHeader.value,
+            authPrefix: form.authPrefix.value || undefined,
+            extraHeaders: form.extraHeaders.value ? JSON.parse(form.extraHeaders.value) : undefined,
+            key: form.key.value,
+            budget: form.budget.value || undefined,
+            isDefault: form.isDefault.checked,
           };
 
-          const res = await fetch('/admin/api/config', {
-            method: 'PUT',
+          const res = await fetch('/v1/aliases', {
+            method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(config)
+            body: JSON.stringify(data)
           });
 
           if (res.ok) {
-            alert('Config saved!');
             location.reload();
           } else {
-            alert('Failed to save config');
+            const err = await res.json();
+            alert('Error: ' + (err.error || 'Failed to add alias'));
           }
+        });
+
+        async function toggleAlias(alias) {
+          const res = await fetch('/v1/aliases/' + encodeURIComponent(alias) + '/toggle', { method: 'POST' });
+          if (res.ok) location.reload();
+        }
+
+        async function deleteAlias(alias) {
+          if (!confirm('Delete alias "' + alias + '"?')) return;
+          const res = await fetch('/v1/aliases/' + encodeURIComponent(alias), { method: 'DELETE' });
+          if (res.ok) location.reload();
+        }
+
+        async function setDefault(alias, host) {
+          const res = await fetch('/admin/api/default', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ host, alias })
+          });
+          if (res.ok) location.reload();
+        }
+
+        function editAlias(alias) {
+          // For now, just alert - could open modal
+          alert('Edit functionality: Delete and re-add with new values, or use the API directly.');
         }
       </script>
     </body>
@@ -689,50 +641,184 @@ app.get('/admin', (c) => {
   `);
 });
 
-// API endpoints for key management
-app.put('/admin/api/keys/:index', async (c) => {
-  const index = parseInt(c.req.param('index'));
-  const body = await c.req.json() as { apiKey: string };
+// =============================================================================
+// API ENDPOINTS
+// =============================================================================
 
-  if (index < 0 || index >= keysStore.providers.length) {
-    return c.json({ error: 'Invalid index' }, 400);
-  }
-
-  keysStore.providers[index].apiKey = body.apiKey;
-  keysStore.providers[index].enabled = !!body.apiKey;
-  keysStore.version++;
-  saveKeysToFile(keysStore);
-
-  return c.json({ success: true });
-});
-
-app.post('/admin/api/keys/:index/toggle', async (c) => {
-  const index = parseInt(c.req.param('index'));
-
-  if (index < 0 || index >= keysStore.providers.length) {
-    return c.json({ error: 'Invalid index' }, 400);
-  }
-
-  keysStore.providers[index].enabled = !keysStore.providers[index].enabled;
-  keysStore.version++;
-  saveKeysToFile(keysStore);
-
-  return c.json({ success: true, enabled: keysStore.providers[index].enabled });
-});
-
-app.get('/admin/api/keys', (c) => {
-  // Return providers without exposing full keys
-  const safeProviders = keysStore.providers.map(p => ({
-    ...p,
-    apiKey: p.apiKey ? p.apiKey.substring(0, 8) + '...' : '',
+// List all aliases (keys redacted)
+app.get('/v1/aliases', (c) => {
+  const aliases = aliasStore.aliases.map(a => ({
+    ...a,
+    key: a.key ? a.key.substring(0, 8) + '...' + a.key.slice(-4) : null,
   }));
-  return c.json({ providers: safeProviders, version: keysStore.version });
+
+  return c.json({
+    aliases,
+    hostDefaults: proxyConfig.hostDefaults,
+    version: aliasStore.version,
+  });
 });
 
-// Cost tracking endpoint
+// Add new alias
+app.post('/v1/aliases', async (c) => {
+  const body = await c.req.json() as Partial<KeyAlias>;
+
+  if (!body.alias || !body.host || !body.authHeader || !body.key) {
+    return c.json({ error: 'Missing required fields: alias, host, authHeader, key' }, 400);
+  }
+
+  // Check for duplicate alias name
+  if (aliasStore.aliases.some(a => a.alias === body.alias)) {
+    return c.json({ error: `Alias "${body.alias}" already exists` }, 409);
+  }
+
+  const newAlias: KeyAlias = {
+    alias: body.alias,
+    description: body.description || '',
+    host: body.host,
+    authHeader: body.authHeader,
+    authPrefix: body.authPrefix,
+    extraHeaders: body.extraHeaders,
+    key: body.key,
+    budget: body.budget,
+    enabled: proxyConfig.requireApproval ? false : true,
+    isDefault: body.isDefault || false,
+    addedAt: new Date().toISOString(),
+    usageCount: 0,
+  };
+
+  aliasStore.aliases.push(newAlias);
+  aliasStore.version++;
+  saveAliasStore(aliasStore);
+
+  // If marked as default, update host defaults
+  if (newAlias.isDefault) {
+    proxyConfig.hostDefaults[newAlias.host] = newAlias.alias;
+    saveProxyConfig(proxyConfig);
+  }
+
+  console.log(`[ALIASES] Added new alias: ${newAlias.alias} for ${newAlias.host}`);
+
+  return c.json({
+    success: true,
+    alias: newAlias.alias,
+    host: newAlias.host,
+    enabled: newAlias.enabled,
+    message: newAlias.enabled
+      ? `Alias "${newAlias.alias}" created and active.`
+      : `Alias "${newAlias.alias}" created but requires admin approval.`,
+  });
+});
+
+// Update alias
+app.put('/v1/aliases/:alias', async (c) => {
+  const aliasName = c.req.param('alias');
+  const body = await c.req.json() as Partial<KeyAlias>;
+
+  const index = aliasStore.aliases.findIndex(a => a.alias === aliasName);
+  if (index === -1) {
+    return c.json({ error: `Alias "${aliasName}" not found` }, 404);
+  }
+
+  // Update fields
+  const alias = aliasStore.aliases[index];
+  if (body.description !== undefined) alias.description = body.description;
+  if (body.host !== undefined) alias.host = body.host;
+  if (body.authHeader !== undefined) alias.authHeader = body.authHeader;
+  if (body.authPrefix !== undefined) alias.authPrefix = body.authPrefix;
+  if (body.extraHeaders !== undefined) alias.extraHeaders = body.extraHeaders;
+  if (body.key !== undefined) alias.key = body.key;
+  if (body.budget !== undefined) alias.budget = body.budget;
+  if (body.enabled !== undefined) alias.enabled = body.enabled;
+  if (body.isDefault !== undefined) {
+    alias.isDefault = body.isDefault;
+    if (body.isDefault) {
+      proxyConfig.hostDefaults[alias.host] = alias.alias;
+      saveProxyConfig(proxyConfig);
+    }
+  }
+
+  aliasStore.version++;
+  saveAliasStore(aliasStore);
+
+  return c.json({ success: true, alias: aliasName });
+});
+
+// Delete alias
+app.delete('/v1/aliases/:alias', (c) => {
+  const aliasName = c.req.param('alias');
+
+  const index = aliasStore.aliases.findIndex(a => a.alias === aliasName);
+  if (index === -1) {
+    return c.json({ error: `Alias "${aliasName}" not found` }, 404);
+  }
+
+  const removed = aliasStore.aliases.splice(index, 1)[0];
+  aliasStore.version++;
+  saveAliasStore(aliasStore);
+
+  // Remove from host defaults if it was default
+  if (proxyConfig.hostDefaults[removed.host] === removed.alias) {
+    delete proxyConfig.hostDefaults[removed.host];
+    saveProxyConfig(proxyConfig);
+  }
+
+  console.log(`[ALIASES] Deleted alias: ${aliasName}`);
+
+  return c.json({ success: true, alias: aliasName });
+});
+
+// Toggle alias enabled/disabled
+app.post('/v1/aliases/:alias/toggle', (c) => {
+  const aliasName = c.req.param('alias');
+
+  const alias = aliasStore.aliases.find(a => a.alias === aliasName);
+  if (!alias) {
+    return c.json({ error: `Alias "${aliasName}" not found` }, 404);
+  }
+
+  alias.enabled = !alias.enabled;
+  aliasStore.version++;
+  saveAliasStore(aliasStore);
+
+  return c.json({ success: true, alias: aliasName, enabled: alias.enabled });
+});
+
+// Set default alias for a host
+app.post('/admin/api/default', async (c) => {
+  const body = await c.req.json() as { host: string; alias: string };
+
+  if (!body.host || !body.alias) {
+    return c.json({ error: 'Missing host or alias' }, 400);
+  }
+
+  // Verify alias exists and matches host
+  const alias = aliasStore.aliases.find(a => a.alias === body.alias);
+  if (!alias) {
+    return c.json({ error: `Alias "${body.alias}" not found` }, 404);
+  }
+  if (alias.host !== body.host) {
+    return c.json({ error: `Alias "${body.alias}" is for host "${alias.host}", not "${body.host}"` }, 400);
+  }
+
+  // Clear isDefault on other aliases for this host
+  for (const a of aliasStore.aliases) {
+    if (a.host === body.host) {
+      a.isDefault = a.alias === body.alias;
+    }
+  }
+
+  proxyConfig.hostDefaults[body.host] = body.alias;
+  saveProxyConfig(proxyConfig);
+  saveAliasStore(aliasStore);
+
+  return c.json({ success: true, host: body.host, defaultAlias: body.alias });
+});
+
+// Cost tracking endpoints
 app.get('/admin/costs', (c) => {
   const last100 = costLog.slice(-100);
-  const totalCost = costLog.reduce((sum, entry) => sum + (entry.estimatedCost || 0), 0);
+  const totalCost = costLog.reduce((sum, e) => sum + (e.estimatedCost || 0), 0);
 
   return c.json({
     totalRequests: costLog.length,
@@ -741,151 +827,22 @@ app.get('/admin/costs', (c) => {
   });
 });
 
-// =============================================================================
-// ADMIN CONFIG ENDPOINTS
-// =============================================================================
+app.get('/admin/costs/by-budget', (c) => {
+  const byBudget: Record<string, { requests: number; cost: number }> = {};
 
-app.get('/admin/api/config', (c) => {
-  return c.json(adminConfig);
-});
-
-app.put('/admin/api/config', async (c) => {
-  const body = await c.req.json() as Partial<AdminConfig>;
-  adminConfig = { ...adminConfig, ...body };
-  saveAdminConfig(adminConfig);
-  return c.json({ success: true, config: adminConfig });
-});
-
-// =============================================================================
-// CONSOLE KEY ENTRY API - Called from chat to add keys
-// =============================================================================
-
-// Lookup provider by short name (e.g., "anthropic", "openai")
-function findProviderByName(name: string): StoredProvider | undefined {
-  const normalizedName = name.toLowerCase().trim();
-  return keysStore.providers.find(p =>
-    p.name.toLowerCase() === normalizedName ||
-    p.host.toLowerCase().includes(normalizedName) ||
-    normalizedName.includes(p.name.toLowerCase().split(' ')[0])
-  );
-}
-
-// POST /v1/keys/:provider - Add a key from console chat
-// Example: POST /v1/keys/anthropic { "key": "sk-ant-..." }
-// Returns: { "success": true, "provider": "Anthropic", "redacted": "sk-ant-a...xyz1" }
-app.post('/v1/keys/:provider', async (c) => {
-  const providerName = c.req.param('provider');
-  const body = await c.req.json() as { key: string };
-
-  if (!body.key) {
-    return c.json({ error: 'Missing key in request body' }, 400);
-  }
-
-  // Check if provider is allowed
-  if (adminConfig.allowedServices.length > 0) {
-    const isAllowed = adminConfig.allowedServices.some(s =>
-      s.toLowerCase() === providerName.toLowerCase()
-    );
-    if (!isAllowed) {
-      return c.json({
-        error: 'Provider not allowed',
-        message: `${providerName} is not in the allowed services list. Contact your admin.`,
-        allowedServices: adminConfig.allowedServices,
-      }, 403);
+  for (const entry of costLog) {
+    const budget = entry.budget || 'unassigned';
+    if (!byBudget[budget]) {
+      byBudget[budget] = { requests: 0, cost: 0 };
     }
+    byBudget[budget].requests++;
+    byBudget[budget].cost += entry.estimatedCost || 0;
   }
 
-  // Find provider template
-  const provider = findProviderByName(providerName);
-  if (!provider) {
-    const availableProviders = keysStore.providers.map(p => p.name.toLowerCase());
-    return c.json({
-      error: 'Unknown provider',
-      message: `Provider "${providerName}" not found.`,
-      availableProviders,
-    }, 404);
-  }
-
-  // Check for admin approval requirement
-  if (adminConfig.requireKeyApproval && !provider.apiKey) {
-    // Store as pending (disabled) for admin approval
-    provider.apiKey = body.key;
-    provider.enabled = false;
-    provider.addedAt = new Date().toISOString();
-    keysStore.version++;
-    saveKeysToFile(keysStore);
-
-    const redacted = body.key.substring(0, 8) + '...' + body.key.slice(-4);
-    return c.json({
-      success: true,
-      pending: true,
-      provider: provider.name,
-      redacted,
-      message: 'Key saved but requires admin approval before activation.',
-    });
-  }
-
-  // Save and enable the key
-  provider.apiKey = body.key;
-  provider.enabled = true;
-  provider.addedAt = new Date().toISOString();
-  keysStore.version++;
-  saveKeysToFile(keysStore);
-
-  const redacted = body.key.substring(0, 8) + '...' + body.key.slice(-4);
-  console.log(`[KEYS] Added key for ${provider.name} via console API (${redacted})`);
-
-  return c.json({
-    success: true,
-    provider: provider.name,
-    host: provider.host,
-    redacted,
-    message: `${provider.name} API key configured and active.`,
-  });
+  return c.json({ byBudget });
 });
 
-// DELETE /v1/keys/:provider - Remove a key
-app.delete('/v1/keys/:provider', (c) => {
-  const providerName = c.req.param('provider');
-  const provider = findProviderByName(providerName);
-
-  if (!provider) {
-    return c.json({ error: 'Provider not found' }, 404);
-  }
-
-  provider.apiKey = '';
-  provider.enabled = false;
-  keysStore.version++;
-  saveKeysToFile(keysStore);
-
-  console.log(`[KEYS] Removed key for ${provider.name} via console API`);
-
-  return c.json({
-    success: true,
-    provider: provider.name,
-    message: `${provider.name} API key removed.`,
-  });
-});
-
-// GET /v1/keys - List configured providers (without exposing full keys)
-app.get('/v1/keys', (c) => {
-  const providers = keysStore.providers.map(p => ({
-    name: p.name,
-    host: p.host,
-    hasKey: !!p.apiKey,
-    enabled: p.enabled,
-    redacted: p.apiKey ? p.apiKey.substring(0, 8) + '...' + p.apiKey.slice(-4) : null,
-  }));
-
-  return c.json({
-    providers,
-    allowedServices: adminConfig.allowedServices.length > 0 ? adminConfig.allowedServices : 'all',
-    requireApproval: adminConfig.requireKeyApproval,
-  });
-});
-
-// POST /v1/redact - Utility to redact API keys from text
-// Used by console to sanitize chat logs before displaying/saving
+// Redact API keys from text
 app.post('/v1/redact', async (c) => {
   const body = await c.req.json() as { text: string };
 
@@ -916,42 +873,66 @@ app.onError((err, c) => {
 });
 
 // =============================================================================
-// MITM PROXY - Intercepts all HTTP/HTTPS traffic, injects API keys
+// MITM PROXY - Intercepts HTTPS traffic, injects API keys based on alias
 // =============================================================================
 
-const mitmProxy = new Proxy();
+const mitmProxy = new MitmProxy();
 
 // Handle request interception
-mitmProxy.onRequest((ctx, callback) => {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+mitmProxy.onRequest((ctx: any, callback: () => void) => {
   const host = ctx.clientToProxyRequest.headers.host || '';
   const method = ctx.clientToProxyRequest.method;
   const url = ctx.clientToProxyRequest.url;
 
-  console.log(`[MITM] ${method} ${ctx.isSSL ? 'https' : 'http'}://${host}${url}`);
+  if (proxyConfig.logRequests) {
+    console.log(`[MITM] ${method} ${ctx.isSSL ? 'https' : 'http'}://${host}${url}`);
+  }
 
-  // Check if this is a known API provider (from dynamic key store)
-  const providers = getActiveProviders();
-  const provider = providers.get(host);
+  // Check for explicit alias header
+  const aliasHeader = ctx.clientToProxyRequest.headers['x-key-alias'] as string | undefined;
 
-  if (provider) {
-    // Build the auth value with optional prefix (e.g., "Bearer ")
-    const authValue = (provider.authPrefix || '') + provider.apiKey;
+  let alias: KeyAlias | undefined;
+
+  if (aliasHeader) {
+    // Use specified alias
+    alias = getAliasByName(aliasHeader);
+    if (!alias) {
+      console.warn(`[MITM] Requested alias "${aliasHeader}" not found, trying default for ${host}`);
+      alias = getDefaultAliasForHost(host);
+    }
+  } else {
+    // Use default alias for this host
+    alias = getDefaultAliasForHost(host);
+  }
+
+  if (alias) {
+    // Build the auth value with optional prefix
+    const authValue = (alias.authPrefix || '') + alias.key;
 
     // Inject authentication header
-    ctx.proxyToServerRequestOptions.headers[provider.authHeader] = authValue;
-    console.log(`[MITM] Injected ${provider.authHeader} for ${host}`);
+    ctx.proxyToServerRequestOptions.headers[alias.authHeader] = authValue;
 
-    // Update last used timestamp
-    const storeProvider = keysStore.providers.find(p => p.host === host);
-    if (storeProvider) {
-      storeProvider.lastUsed = new Date().toISOString();
+    if (proxyConfig.logRequests) {
+      console.log(`[MITM] Using alias "${alias.alias}" for ${host}`);
     }
 
+    // Update usage stats
+    alias.lastUsed = new Date().toISOString();
+    alias.usageCount = (alias.usageCount || 0) + 1;
+
     // Add extra headers if configured
-    if (provider.extraHeaders) {
-      for (const [key, value] of Object.entries(provider.extraHeaders)) {
+    if (alias.extraHeaders) {
+      for (const [key, value] of Object.entries(alias.extraHeaders)) {
         ctx.proxyToServerRequestOptions.headers[key] = value;
       }
+    }
+
+    // Remove the alias header before forwarding
+    delete ctx.proxyToServerRequestOptions.headers['x-key-alias'];
+  } else {
+    if (proxyConfig.logRequests) {
+      console.log(`[MITM] No alias configured for ${host}, passing through`);
     }
   }
 
@@ -959,12 +940,14 @@ mitmProxy.onRequest((ctx, callback) => {
 });
 
 // Handle response for cost tracking
-mitmProxy.onResponse((ctx, callback) => {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+mitmProxy.onResponse((ctx: any, callback: () => void) => {
   const host = ctx.clientToProxyRequest.headers.host || '';
-  const providers = getActiveProviders();
-  const provider = providers.get(host);
+  const aliasHeader = ctx.clientToProxyRequest.headers['x-key-alias'] as string | undefined;
 
-  if (provider) {
+  let alias = aliasHeader ? getAliasByName(aliasHeader) : getDefaultAliasForHost(host);
+
+  if (alias) {
     // Collect response body for cost tracking
     let responseBody = '';
     const originalWrite = ctx.proxyToClientResponse.write.bind(ctx.proxyToClientResponse);
@@ -985,8 +968,7 @@ mitmProxy.onResponse((ctx, callback) => {
       // Track cost asynchronously
       try {
         const parsedResponse = JSON.parse(responseBody);
-        const providerName = host.includes('anthropic') ? 'anthropic' : 'openai';
-        trackCost(providerName, ctx.clientToProxyRequest.url || '', ctx.clientToProxyRequest.method || 'GET', undefined, parsedResponse);
+        trackCost(alias!, ctx.clientToProxyRequest.url || '', ctx.clientToProxyRequest.method || 'GET', parsedResponse);
       } catch {
         // Not JSON, skip cost tracking
       }
@@ -999,7 +981,8 @@ mitmProxy.onResponse((ctx, callback) => {
 });
 
 // Handle errors
-mitmProxy.onError((_ctx, err) => {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+mitmProxy.onError((_ctx: any, err: Error) => {
   console.error('[MITM] Proxy error:', err);
 });
 
@@ -1007,40 +990,38 @@ mitmProxy.onError((_ctx, err) => {
 // START SERVERS
 // =============================================================================
 
-// Build provider list for banner
-const startupProviders = getActiveProviders();
-const providerList = Array.from(startupProviders.keys());
-const providerDisplay = providerList.length > 0
-  ? providerList.map(h => `║    • ${h.padEnd(54)}║`).join('\n')
-  : '║    (no API keys configured - use Admin UI to add)            ║';
+const activeAliases = aliasStore.aliases.filter(a => a.enabled);
+const hosts = getUniqueHosts();
 
 console.log(`
 ╔════════════════════════════════════════════════════════════════╗
-║               Boardroom API Proxy Server                       ║
+║            Boardroom API Proxy Server (Alias Mode)             ║
 ╠════════════════════════════════════════════════════════════════╣
-║  Admin UI:    http://0.0.0.0:${config.port}/admin${' '.repeat(30)}║
-║  MITM Proxy:  http://0.0.0.0:${config.proxyPort}${' '.repeat(36)}║
-║  Keys File:   ${KEYS_FILE.padEnd(49)}║
+║  Admin UI:    http://0.0.0.0:${serverConfig.port}/admin${' '.repeat(30)}║
+║  MITM Proxy:  http://0.0.0.0:${serverConfig.proxyPort}${' '.repeat(36)}║
+║  Aliases:     ${ALIASES_FILE.padEnd(49)}║
 ╠════════════════════════════════════════════════════════════════╣
-║  Active Providers (${providerList.length.toString().padEnd(2)} configured):                         ║
-${providerDisplay}
+║  Active Aliases: ${activeAliases.length.toString().padEnd(3)} | Unique Hosts: ${hosts.length.toString().padEnd(23)}║
+${activeAliases.length > 0
+  ? activeAliases.slice(0, 5).map(a => `║    • ${a.alias.padEnd(30)} → ${a.host.padEnd(22)}║`).join('\n') + (activeAliases.length > 5 ? `\n║    ... and ${activeAliases.length - 5} more${' '.repeat(46)}║` : '')
+  : '║    (no aliases configured - use Admin UI to add)            ║'}
 ╠════════════════════════════════════════════════════════════════╣
-║  Keys can be added/edited via Admin UI - no restart needed!    ║
-║  Console config: HTTP_PROXY=http://proxy:${config.proxyPort}                 ║
+║  Usage: Set X-Key-Alias header to select specific alias        ║
+║  Or configure default aliases per host in Admin UI             ║
 ╚════════════════════════════════════════════════════════════════╝
 `);
 
-// Start Hono server (admin + direct endpoints)
+// Start Hono server (admin + API)
 serve({
   fetch: app.fetch,
-  port: config.port,
+  port: serverConfig.port,
 });
 
 // Start MITM proxy
 mitmProxy.listen({
-  port: config.proxyPort,
+  port: serverConfig.proxyPort,
   sslCaDir: certsDir,
 }, () => {
-  console.log(`[MITM] Proxy listening on port ${config.proxyPort}`);
+  console.log(`[MITM] Proxy listening on port ${serverConfig.proxyPort}`);
   console.log(`[MITM] CA certificates stored in: ${certsDir}`);
 });
