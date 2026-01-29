@@ -5,14 +5,14 @@
 # Creates isolated Docker network, console container, and proxy container for a user.
 # Each user gets their own proxy for complete API key isolation.
 #
-# Usage: ./create-user.sh <company> <username> [--test] [--remote <host>]
+# Usage: ./create-user.sh <company> <username> [--email <email>] [--test] [--remote <host>]
 #
 # Naming Convention:
-#   Network:   {username}-network
-#   Console:   {username}-{company}-console
-#   Proxy:     {username}-{company}-proxy
-#   Data:      /home/boardroom/data/{username}-console
-#              /home/boardroom/data/{username}-proxy
+#   Network:   {company}-{username}-network
+#   Console:   {company}-{username}-console
+#   Proxy:     {company}-{username}-proxy
+#   Data:      /home/boardroom/data/{company}-{username}-console
+#              /home/boardroom/data/{company}-{username}-proxy
 #
 
 set -euo pipefail
@@ -25,8 +25,16 @@ CONSOLE_IMAGE="${CONSOLE_IMAGE:-ghcr.io/lemalogic/boardroom-console:amd64}"
 PROXY_IMAGE="${PROXY_IMAGE:-boardroom-api-proxy:latest}"
 COMPANY=""  # Required argument
 
+# OpenRouter API key provisioning
+OPENROUTER_PROVISIONING_KEY="${OPENROUTER_PROVISIONING_KEY:-}"
+OPENROUTER_API_BASE="https://openrouter.ai/api/v1/keys"
+OPENROUTER_DEFAULT_LIMIT=100  # $100/month default
+
 # Remote execution (uses ~/.ssh/config for host resolution)
 REMOTE_HOST=""
+
+# User email (displayed in UI header)
+USER_EMAIL=""
 
 # SSH port allocation (start at 2224, brian=2222, dan=2223)
 SSH_PORT_BASE=2224
@@ -98,7 +106,7 @@ log_error() {
 # Display usage information
 usage() {
     cat << EOF
-Usage: $(basename "$0") <company> <username> [--test] [--remote <ssh-host>]
+Usage: $(basename "$0") <company> <username> [--email <email>] [--test] [--remote <ssh-host>]
 
 Create a new Boardroom user environment with isolated Docker containers.
 
@@ -107,6 +115,7 @@ Arguments:
     username            Username for the new environment (lowercase alphanumeric, hyphens, underscores)
 
 Options:
+    --email <email>     User email to display in UI header
     --test              Run end-to-end test after creation
     --remote <host>     Execute on remote server via SSH config host name
     --help, -h          Show this help message
@@ -135,20 +144,191 @@ Examples:
 
 Architecture:
     Each user gets:
-    - Isolated Docker network ({username}-network)
-    - Dedicated proxy container with API keys ({username}-{company}-proxy)
-    - Console container without API keys ({username}-{company}-console)
+    - Isolated Docker network ({company}-{username}-network)
+    - Dedicated proxy container with API keys ({company}-{username}-proxy)
+    - Console container without API keys ({company}-{username}-console)
+    - Git-versioned persistent storage for settings, config, and history
 
     The console can ONLY communicate with its own proxy (network isolation).
 
 Container Naming:
     company=lemalogic, username=alice creates:
-    - alice-network
-    - alice-lemalogic-console
-    - alice-lemalogic-proxy
+    - lemalogic-alice-network
+    - lemalogic-alice-console
+    - lemalogic-alice-proxy
+    - /home/boardroom/data/lemalogic-alice-console (git repo)
 EOF
     exit 1
 }
+
+# =============================================================================
+# OpenRouter API Key Provisioning
+# =============================================================================
+
+# Check if OpenRouter provisioning is available
+openrouter_available() {
+    [[ -n "$OPENROUTER_PROVISIONING_KEY" ]]
+}
+
+# Get OpenRouter key name for this user
+get_openrouter_key_name() {
+    local username="$1"
+    echo "${COMPANY}-${username}-boardroom"
+}
+
+# Check if OpenRouter key exists by name, returns key hash if found
+openrouter_key_exists() {
+    local key_name="$1"
+    local response hash
+
+    response=$(curl -s "$OPENROUTER_API_BASE" \
+        -H "Authorization: Bearer $OPENROUTER_PROVISIONING_KEY" 2>/dev/null)
+
+    if [[ -z "$response" ]]; then
+        return 1
+    fi
+
+    # Extract hash for key with matching name
+    hash=$(echo "$response" | jq -r --arg name "$key_name" \
+        '.data[] | select(.name == $name) | .hash' 2>/dev/null)
+
+    if [[ -n "$hash" && "$hash" != "null" ]]; then
+        echo "$hash"
+        return 0
+    fi
+    return 1
+}
+
+# Create new OpenRouter API key with spending limit
+openrouter_create_key() {
+    local key_name="$1"
+    local limit="${2:-$OPENROUTER_DEFAULT_LIMIT}"
+
+    local response
+    response=$(curl -s -X POST "$OPENROUTER_API_BASE" \
+        -H "Authorization: Bearer $OPENROUTER_PROVISIONING_KEY" \
+        -H "Content-Type: application/json" \
+        -d "{
+            \"name\": \"$key_name\",
+            \"limit\": $limit,
+            \"limit_reset\": \"monthly\"
+        }" 2>/dev/null)
+
+    echo "$response"
+}
+
+# Enable a disabled OpenRouter key
+openrouter_enable_key() {
+    local key_hash="$1"
+
+    curl -s -X PATCH "${OPENROUTER_API_BASE}/${key_hash}" \
+        -H "Authorization: Bearer $OPENROUTER_PROVISIONING_KEY" \
+        -H "Content-Type: application/json" \
+        -d '{"disabled": false}' 2>/dev/null
+}
+
+# Check if key is disabled
+openrouter_key_disabled() {
+    local key_hash="$1"
+    local response disabled
+
+    response=$(curl -s "${OPENROUTER_API_BASE}/${key_hash}" \
+        -H "Authorization: Bearer $OPENROUTER_PROVISIONING_KEY" 2>/dev/null)
+
+    disabled=$(echo "$response" | jq -r '.data.disabled' 2>/dev/null)
+    [[ "$disabled" == "true" ]]
+}
+
+# Provision OpenRouter API key for user
+# Returns: the actual API key (only shown once at creation)
+provision_openrouter_key() {
+    local username="$1"
+    local key_name api_key key_hash response
+
+    if ! openrouter_available; then
+        log_warn "OPENROUTER_PROVISIONING_KEY not set, skipping OpenRouter key provisioning"
+        return 1
+    fi
+
+    key_name=$(get_openrouter_key_name "$username")
+    log_info "Checking for existing OpenRouter key: ${key_name}"
+
+    # Check if key already exists
+    if key_hash=$(openrouter_key_exists "$key_name"); then
+        log_info "Found existing OpenRouter key (hash: ${key_hash:0:8}...)"
+
+        # Check if it's disabled and re-enable it
+        if openrouter_key_disabled "$key_hash"; then
+            log_info "Key is disabled, re-enabling..."
+            openrouter_enable_key "$key_hash"
+            log_success "Re-enabled OpenRouter key"
+        fi
+
+        # Note: We cannot retrieve the actual key after creation
+        # User must have stored it previously
+        log_warn "Cannot retrieve existing key value - key was created previously"
+        log_warn "If key is lost, delete and recreate the user environment"
+        return 2  # Key exists but we don't have the value
+    fi
+
+    # Create new key
+    log_info "Creating new OpenRouter key with \$${OPENROUTER_DEFAULT_LIMIT}/month limit..."
+    response=$(openrouter_create_key "$key_name" "$OPENROUTER_DEFAULT_LIMIT")
+
+    # Extract the actual API key (only returned at creation time!)
+    api_key=$(echo "$response" | jq -r '.key' 2>/dev/null)
+    key_hash=$(echo "$response" | jq -r '.data.hash' 2>/dev/null)
+
+    if [[ -z "$api_key" || "$api_key" == "null" ]]; then
+        log_error "Failed to create OpenRouter key"
+        log_error "Response: $response"
+        return 1
+    fi
+
+    log_success "Created OpenRouter API key (hash: ${key_hash:0:8}...)"
+
+    # Return the key
+    echo "$api_key"
+    return 0
+}
+
+# Deploy OpenRouter key to proxy container's keys.json
+deploy_openrouter_key_to_proxy() {
+    local username="$1"
+    local api_key="$2"
+    local proxy_dir="${DATA_BASE_DIR}/${COMPANY}-${username}-proxy"
+    local keys_file="${proxy_dir}/keys.json"
+    local stub_key="stub-openrouter-${COMPANY}-${username}"
+
+    log_info "Deploying OpenRouter key to proxy..."
+
+    # Create or update keys.json with the OpenRouter key
+    # The stub format allows the proxy to replace it with the real key
+    local keys_content
+
+    # Check if keys.json already exists
+    if run_cmd "test -f '$keys_file'" 2>/dev/null; then
+        # Update existing file - add/update the OpenRouter key
+        run_cmd "cat '$keys_file' | jq --arg stub '$stub_key' --arg key '$api_key' '. + {(\$stub): \$key}' > '${keys_file}.tmp' && mv '${keys_file}.tmp' '$keys_file'"
+    else
+        # Create new keys.json
+        keys_content="{\"${stub_key}\": \"${api_key}\"}"
+        if [[ -n "$REMOTE_HOST" ]]; then
+            ssh "$REMOTE_HOST" "echo '$keys_content' > '$keys_file'"
+        else
+            echo "$keys_content" > "$keys_file"
+        fi
+    fi
+
+    log_success "Deployed OpenRouter key to: ${keys_file}"
+
+    # Return the stub key name for use in moltbot config
+    echo "$stub_key"
+}
+
+# =============================================================================
+# Validation Functions
+# =============================================================================
 
 # Validate company format
 validate_company() {
@@ -214,10 +394,10 @@ check_docker() {
 # Check if user environment already exists
 check_existing() {
     local username="$1"
-    local network_name="${username}-network"
+    local network_name="${COMPANY}-${username}-network"
 
     if docker_cmd "network inspect '$network_name'" &>/dev/null; then
-        log_error "User environment for '${username}' already exists"
+        log_error "User environment for '${COMPANY}/${username}' already exists"
         log_error "Use remove-user.sh to delete it first, or choose a different username"
         exit 1
     fi
@@ -234,7 +414,7 @@ find_available_ports() {
 
     # Count existing user networks to determine port offset
     local user_count
-    user_count=$(docker_cmd "network ls --filter 'name=-network$' --format '{{.Name}}'" | grep -v "brian-network\|dan-network\|admin-network" | wc -l | tr -d ' ')
+    user_count=$(docker_cmd "network ls --filter 'name=-network$' --format '{{.Name}}'" | grep -v "lemalogic-brian-network\|lemalogic-dan-network\|lemalogic-admin-network" | wc -l | tr -d ' ')
 
     SSH_PORT=$((SSH_PORT_BASE + user_count))
     GATEWAY_PORT=$((GATEWAY_PORT_BASE + user_count))
@@ -245,22 +425,65 @@ find_available_ports() {
 # Create directories for user data
 create_directories() {
     local username="$1"
-    local console_dir="${DATA_BASE_DIR}/${username}-console"
-    local proxy_dir="${DATA_BASE_DIR}/${username}-proxy"
+    local console_dir="${DATA_BASE_DIR}/${COMPANY}-${username}-console"
+    local proxy_dir="${DATA_BASE_DIR}/${COMPANY}-${username}-proxy"
 
-    log_info "Creating data directories for user: ${username}"
+    log_info "Creating data directories for user: ${COMPANY}/${username}"
 
     make_dir "$console_dir"
     make_dir "$proxy_dir"
+
+    # Initialize console directory as git repo for versioning
+    init_git_repo "$console_dir" "$username"
 
     log_success "Created console directory: ${console_dir}"
     log_success "Created proxy directory: ${proxy_dir}"
 }
 
+# Initialize git repository for versioning user data
+init_git_repo() {
+    local dir="$1"
+    local username="$2"
+
+    log_info "Initializing git repository for versioning..."
+
+    # Create .gitignore for caches and runtime data
+    local gitignore_content='# Caches and runtime data (do not version)
+.cache/
+.npm/
+.nvm/
+.local/
+*.log
+*.tmp
+node_modules/
+__pycache__/
+.DS_Store
+
+# Large binary files
+*.zip
+*.tar.gz
+*.tgz
+'
+
+    if [[ -n "$REMOTE_HOST" ]]; then
+        ssh "$REMOTE_HOST" "cd '$dir' && git init && git config user.email 'boardroom@lemalogic.com' && git config user.name 'Boardroom System' && echo '$gitignore_content' > .gitignore && git add .gitignore && git commit -m 'Initialize user data repository for ${username}'"
+    else
+        cd "$dir"
+        git init
+        git config user.email "boardroom@lemalogic.com"
+        git config user.name "Boardroom System"
+        echo "$gitignore_content" > .gitignore
+        git add .gitignore
+        git commit -m "Initialize user data repository for ${username}"
+    fi
+
+    log_success "Initialized git repository with .gitignore"
+}
+
 # Create Docker network
 create_network() {
     local username="$1"
-    local network_name="${username}-network"
+    local network_name="${COMPANY}-${username}-network"
     local created_at
     created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -280,11 +503,15 @@ create_network() {
 create_moltbot_config() {
     local username="$1"
     local gateway_token="$2"
-    local console_dir="${DATA_BASE_DIR}/${username}-console"
-    local proxy_hostname="${username}-proxy"
-    local config_file="${console_dir}/moltbot.json"
+    local openrouter_stub="${3:-stub-openrouter-${COMPANY}-${username}}"
+    local console_dir="${DATA_BASE_DIR}/${COMPANY}-${username}-console"
+    local proxy_hostname="${COMPANY}-${username}-proxy"
+    local config_file="${console_dir}/.clawdbot-dev/moltbot.json"
 
     log_info "Creating moltbot configuration..."
+
+    # Create .clawdbot-dev directory (moltbot expects config here)
+    make_dir "${console_dir}/.clawdbot-dev"
 
     local config_content='{
   "gateway": {
@@ -299,17 +526,17 @@ create_moltbot_config() {
   "models": {
     "providers": {
       "openrouter": {
-        "apiKey": "not-needed-proxy-injects",
+        "apiKey": "'"${openrouter_stub}"'",
         "baseUrl": "http://'"${proxy_hostname}"':8080/v1/openrouter",
         "models": []
       },
       "anthropic": {
-        "apiKey": "not-needed-proxy-injects",
+        "apiKey": "stub-anthropic-'"${COMPANY}"'-'"${username}"'",
         "baseUrl": "http://'"${proxy_hostname}"':8080/v1/anthropic",
         "models": []
       },
       "openai": {
-        "apiKey": "not-needed-proxy-injects",
+        "apiKey": "stub-openai-'"${COMPANY}"'-'"${username}"'",
         "baseUrl": "http://'"${proxy_hostname}"':8080/v1/openai",
         "models": []
       }
@@ -332,9 +559,9 @@ create_moltbot_config() {
 # Create proxy container
 create_proxy_container() {
     local username="$1"
-    local container_name="${username}-${COMPANY}-proxy"
-    local network_name="${username}-network"
-    local proxy_dir="${DATA_BASE_DIR}/${username}-proxy"
+    local container_name="${COMPANY}-${username}-proxy"
+    local network_name="${COMPANY}-${username}-network"
+    local proxy_dir="${DATA_BASE_DIR}/${COMPANY}-${username}-proxy"
     local created_at
     created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -343,7 +570,8 @@ create_proxy_container() {
     docker_cmd "create \
         --name '${container_name}' \
         --network '${network_name}' \
-        --hostname '${username}-proxy' \
+        --network-alias '${COMPANY}-${username}-proxy' \
+        --hostname '${COMPANY}-${username}-proxy' \
         --restart unless-stopped \
         --label 'boardroom.user=${username}' \
         --label 'boardroom.company=${COMPANY}' \
@@ -359,9 +587,9 @@ create_proxy_container() {
 create_console_container() {
     local username="$1"
     local gateway_token="$2"
-    local container_name="${username}-${COMPANY}-console"
-    local network_name="${username}-network"
-    local console_dir="${DATA_BASE_DIR}/${username}-console"
+    local container_name="${COMPANY}-${username}-console"
+    local network_name="${COMPANY}-${username}-network"
+    local console_dir="${DATA_BASE_DIR}/${COMPANY}-${username}-console"
     local created_at
     created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -370,7 +598,8 @@ create_console_container() {
     docker_cmd "create \
         --name '${container_name}' \
         --network '${network_name}' \
-        --hostname '${username}-console' \
+        --network-alias '${COMPANY}-${username}-console' \
+        --hostname '${COMPANY}-${username}-console' \
         --restart unless-stopped \
         --label 'boardroom.user=${username}' \
         --label 'boardroom.company=${COMPANY}' \
@@ -378,8 +607,9 @@ create_console_container() {
         --label 'boardroom.created=${created_at}' \
         --publish '${SSH_PORT}:22' \
         --publish '${GATEWAY_PORT}:19001' \
-        --volume '${console_dir}:/home/boardroom/.clawdbot-dev:rw' \
+        --volume '${console_dir}:/home/boardroom:rw' \
         --env 'CLAWDBOT_GATEWAY_TOKEN=${gateway_token}' \
+        --env 'BOARDROOM_USER_EMAIL=${USER_EMAIL}' \
         '${CONSOLE_IMAGE}'"
 
     log_success "Created console container: ${container_name}"
@@ -388,8 +618,8 @@ create_console_container() {
 # Start containers in correct order (proxy first, then console)
 start_containers() {
     local username="$1"
-    local proxy_name="${username}-${COMPANY}-proxy"
-    local console_name="${username}-${COMPANY}-console"
+    local proxy_name="${COMPANY}-${username}-proxy"
+    local console_name="${COMPANY}-${username}-console"
 
     log_info "Starting proxy container..."
     docker_cmd "start '${proxy_name}'"
@@ -419,7 +649,7 @@ start_containers() {
 # Configure Cloudflare Tunnel route
 configure_cloudflare_tunnel() {
     local username="$1"
-    local subdomain="${username}-${COMPANY}.boardroom.site"
+    local subdomain="${COMPANY}-${username}.boardroom.site"
 
     log_info "Cloudflare Tunnel configuration required"
 
@@ -444,7 +674,7 @@ EOF
 run_test() {
     local username="$1"
     local gateway_token="$2"
-    local console_name="${username}-${COMPANY}-console"
+    local console_name="${COMPANY}-${username}-console"
 
     log_info "Running end-to-end test..."
 
@@ -503,25 +733,34 @@ run_test() {
 display_summary() {
     local username="$1"
     local gateway_token="$2"
-    local subdomain="${username}-${COMPANY}.boardroom.site"
+    local openrouter_provisioned="${3:-false}"
+    local subdomain="${COMPANY}-${username}.boardroom.site"
 
     echo ""
     echo "=============================================="
     echo -e "${GREEN}User Environment Created Successfully${NC}"
     echo "=============================================="
     echo ""
+    echo "Company:         ${COMPANY}"
     echo "Username:        ${username}"
     echo "Gateway Token:   ${gateway_token}"
     echo ""
     echo "Resources Created:"
-    echo "  Network:       ${username}-network"
-    echo "  Console:       ${username}-${COMPANY}-console"
-    echo "  Proxy:         ${username}-${COMPANY}-proxy"
+    echo "  Network:       ${COMPANY}-${username}-network"
+    echo "  Console:       ${COMPANY}-${username}-console"
+    echo "  Proxy:         ${COMPANY}-${username}-proxy"
     echo ""
-    echo "Data Directories:"
-    echo "  Console:       ${DATA_BASE_DIR}/${username}-console"
-    echo "  Proxy:         ${DATA_BASE_DIR}/${username}-proxy"
+    echo "Data Directories (git versioned):"
+    echo "  Console:       ${DATA_BASE_DIR}/${COMPANY}-${username}-console"
+    echo "  Proxy:         ${DATA_BASE_DIR}/${COMPANY}-${username}-proxy"
     echo ""
+    if [[ "$openrouter_provisioned" == "true" ]]; then
+        echo "OpenRouter API:"
+        echo "  Key Name:      ${COMPANY}-${username}-boardroom"
+        echo "  Limit:         \$${OPENROUTER_DEFAULT_LIMIT}/month"
+        echo "  Status:        Active"
+        echo ""
+    fi
     echo "Ports:"
     echo "  SSH:           ${SSH_PORT}"
     echo "  Gateway:       ${GATEWAY_PORT}"
@@ -533,12 +772,14 @@ display_summary() {
     echo "  Console:       https://${subdomain}/?token=${gateway_token}"
     echo ""
     echo "Container Management:"
-    echo "  View logs:     docker logs -f ${username}-${COMPANY}-console"
-    echo "  Shell:         docker exec -it ${username}-${COMPANY}-console bash"
-    echo "  Stop:          docker stop ${username}-${COMPANY}-console ${username}-${COMPANY}-proxy"
-    echo "  Remove:        ./remove-user.sh ${username}"
+    echo "  View logs:     docker logs -f ${COMPANY}-${username}-console"
+    echo "  Shell:         docker exec -it ${COMPANY}-${username}-console bash"
+    echo "  Stop:          docker stop ${COMPANY}-${username}-console ${COMPANY}-${username}-proxy"
+    echo "  Remove:        ./remove-user.sh ${COMPANY} ${username}"
     echo ""
-    echo "Add to docker-compose.lemalogic.yml for persistence (see existing entries)"
+    echo "Version Control:"
+    echo "  View history:  cd ${DATA_BASE_DIR}/${COMPANY}-${username}-console && git log --oneline"
+    echo "  Commit:        cd ${DATA_BASE_DIR}/${COMPANY}-${username}-console && git add -A && git commit -m 'description'"
     echo ""
 }
 
@@ -569,6 +810,14 @@ main() {
                 REMOTE_HOST="$2"
                 shift 2
                 ;;
+            --email)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "--email requires an email address argument"
+                    usage
+                fi
+                USER_EMAIL="$2"
+                shift 2
+                ;;
             -h|--help)
                 usage
                 ;;
@@ -587,7 +836,7 @@ main() {
     if [[ ${#positional_args[@]} -lt 2 ]]; then
         log_error "Missing required arguments: company and username"
         echo ""
-        echo "Usage: $(basename "$0") <company> <username> [--test] [--remote <host>]"
+        echo "Usage: $(basename "$0") <company> <username> [--email <email>] [--test] [--remote <host>]"
         echo ""
         echo "Example: $(basename "$0") lemalogic alice --remote 46.224.211.238"
         exit 1
@@ -635,13 +884,28 @@ main() {
     # Create user environment
     create_directories "$username"
     create_network "$username"
-    create_moltbot_config "$username" "$gateway_token"
+
+    # Provision OpenRouter API key (if provisioning key available)
+    local openrouter_stub="stub-openrouter-${COMPANY}-${username}"
+    local openrouter_api_key=""
+    local openrouter_provisioned="false"
+    if openrouter_available; then
+        openrouter_api_key=$(provision_openrouter_key "$username") || true
+        if [[ -n "$openrouter_api_key" && "$openrouter_api_key" != "" ]]; then
+            openrouter_stub=$(deploy_openrouter_key_to_proxy "$username" "$openrouter_api_key")
+            openrouter_provisioned="true"
+        fi
+    else
+        log_warn "OpenRouter provisioning skipped (set OPENROUTER_PROVISIONING_KEY to enable)"
+    fi
+
+    create_moltbot_config "$username" "$gateway_token" "$openrouter_stub"
     create_proxy_container "$username"
     create_console_container "$username" "$gateway_token"
     start_containers "$username"
 
     # Display summary first
-    display_summary "$username" "$gateway_token"
+    display_summary "$username" "$gateway_token" "$openrouter_provisioned"
 
     # Run tests if requested
     if [[ "$run_test_flag" == true ]]; then

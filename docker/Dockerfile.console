@@ -116,11 +116,13 @@ RUN apt-get update && apt-get install -y \
 # Create Non-Root User
 # -----------------------------------------------------------------------------
 # Create 'boardroom' user with sudo access for security best practices
-# - Use UID/GID 1001 to avoid conflicts with existing ubuntu user (1000)
+# - Use UID/GID 1000 to match typical host user (ubuntu) for volume mounts
+# - Remove existing ubuntu user first if present
 # - Passwordless sudo for convenience in development
 # - Home directory at /home/boardroom
-RUN groupadd --gid 1001 boardroom \
-    && useradd --uid 1001 --gid boardroom --shell /bin/bash --create-home boardroom \
+RUN userdel -r ubuntu 2>/dev/null || true \
+    && groupadd --gid 1000 boardroom \
+    && useradd --uid 1000 --gid boardroom --shell /bin/bash --create-home boardroom \
     && echo 'boardroom ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers.d/boardroom \
     && chmod 0440 /etc/sudoers.d/boardroom
 
@@ -231,6 +233,35 @@ COPY --chown=boardroom:boardroom patches/apply-branding.sh /tmp/apply-branding.s
 RUN chmod +x /tmp/apply-branding.sh && /tmp/apply-branding.sh /app/moltbot
 
 # -----------------------------------------------------------------------------
+# Disable Token Authentication
+# -----------------------------------------------------------------------------
+# Apply patch to allow anonymous access when behind authenticated reverse proxy
+# (e.g., Cloudflare Tunnel with Access SSO)
+COPY --chown=boardroom:boardroom patches/disable-token-auth.sh /tmp/disable-token-auth.sh
+RUN chmod +x /tmp/disable-token-auth.sh && /tmp/disable-token-auth.sh /app/moltbot
+
+# Build gateway with auth bypass patch applied
+RUN cd /app/moltbot \
+    && source $NVM_DIR/nvm.sh \
+    && pnpm build
+
+# -----------------------------------------------------------------------------
+# Verify Branding Patches Applied
+# -----------------------------------------------------------------------------
+# Fail the build if branding patches weren't applied correctly
+RUN echo "Verifying branding patches..." \
+    && echo "Checking index.html title..." \
+    && grep -i "title.*boardroom" /app/moltbot/ui/index.html \
+    || (echo "ERROR: Page title should contain 'Boardroom'" && cat /app/moltbot/ui/index.html | grep -i title && exit 1) \
+    && echo "Checking app-render.ts for BOARDROOM brand..." \
+    && grep -q "BOARDROOM" /app/moltbot/ui/src/ui/app-render.ts \
+    || (echo "ERROR: Header branding patch not applied - BOARDROOM not found" && exit 1) \
+    && echo "Checking no Moltbot remains in title..." \
+    && ! grep -q "<title>Moltbot" /app/moltbot/ui/index.html \
+    || (echo "ERROR: index.html still contains 'Moltbot' in title" && exit 1) \
+    && echo "Branding patches verified successfully!"
+
+# -----------------------------------------------------------------------------
 # Build Control UI
 # -----------------------------------------------------------------------------
 # Build the web-based Control UI assets (with Boardroom branding)
@@ -304,15 +335,23 @@ RUN mkdir -p /home/boardroom/.moltbot /home/boardroom/.clawdbot-dev && \
     cp /home/boardroom/.moltbot/moltbot.json /home/boardroom/.clawdbot-dev/moltbot.json
 
 # -----------------------------------------------------------------------------
+# User Email Injection Script
+# -----------------------------------------------------------------------------
+# Copy script that injects BOARDROOM_USER_EMAIL into the UI at runtime
+COPY --chown=boardroom:boardroom patches/inject-user-email.sh /usr/local/bin/inject-user-email.sh
+RUN chmod +x /usr/local/bin/inject-user-email.sh
+
+# -----------------------------------------------------------------------------
 # Entrypoint Script
 # -----------------------------------------------------------------------------
 # The entrypoint script:
 # 1. Installs the MITM proxy CA cert (mounted at runtime)
-# 2. Configures Python/Node to trust the CA cert
-# 3. Starts the SSH daemon
-# 4. Starts the moltbot gateway
+# 2. Injects BOARDROOM_USER_EMAIL into the UI
+# 3. Configures Python/Node to trust the CA cert
+# 4. Starts the SSH daemon
+# 5. Starts the moltbot gateway
 USER root
-RUN printf '#!/bin/bash\nset -e\n\n# Install MITM proxy CA cert if available\nCA_CERT="/etc/boardroom-proxy-certs/ca.pem"\nif [ -f "$CA_CERT" ]; then\n    echo "Installing MITM proxy CA certificate..."\n    cp "$CA_CERT" /usr/local/share/ca-certificates/boardroom-proxy.crt\n    update-ca-certificates\n    # Also set for Python requests/httpx\n    export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\n    export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt\n    export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt\nelse\n    echo "Warning: MITM proxy CA cert not found at $CA_CERT"\n    echo "HTTPS traffic may not be intercepted correctly."\nfi\n\n# Start SSH daemon in background\necho "Starting SSH daemon..."\n/usr/sbin/sshd\n\n# Switch to boardroom user and start the gateway\necho "Starting Boardroom Command Center..."\ncd /app/moltbot\nexec su - boardroom -c "export CLAWDBOT_GATEWAY_TOKEN=$CLAWDBOT_GATEWAY_TOKEN && export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt && export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt && export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt && source ~/.nvm/nvm.sh && cd /app/moltbot && pnpm run gateway:dev"\n' > /usr/local/bin/entrypoint.sh \
+RUN printf '#!/bin/bash\nset -e\n\n# Install MITM proxy CA cert if available\nCA_CERT="/etc/boardroom-proxy-certs/ca.pem"\nif [ -f "$CA_CERT" ]; then\n    echo "Installing MITM proxy CA certificate..."\n    cp "$CA_CERT" /usr/local/share/ca-certificates/boardroom-proxy.crt\n    update-ca-certificates\n    # Also set for Python requests/httpx\n    export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\n    export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt\n    export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt\nelse\n    echo "Warning: MITM proxy CA cert not found at $CA_CERT"\n    echo "HTTPS traffic may not be intercepted correctly."\nfi\n\n# Inject user email into UI header\nif [ -n "$BOARDROOM_USER_EMAIL" ]; then\n    /usr/local/bin/inject-user-email.sh\nfi\n\n# Start SSH daemon in background\necho "Starting SSH daemon..."\n/usr/sbin/sshd\n\n# Switch to boardroom user and start the gateway\necho "Starting Boardroom Command Center..."\ncd /app/moltbot\nexec su - boardroom -c "export CLAWDBOT_GATEWAY_TOKEN=$CLAWDBOT_GATEWAY_TOKEN && export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt && export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt && export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt && source ~/.nvm/nvm.sh && cd /app/moltbot && pnpm run gateway:dev"\n' > /usr/local/bin/entrypoint.sh \
     && chmod +x /usr/local/bin/entrypoint.sh
 
 # -----------------------------------------------------------------------------
