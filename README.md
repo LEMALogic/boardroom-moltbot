@@ -223,7 +223,8 @@ boardroom-moltbot/
 │       └── Dockerfile
 ├── proxy/                       # Hono API proxy source
 ├── scripts/
-│   ├── provision-user.sh        # User provisioning
+│   ├── create-user.sh           # Create new user environment
+│   ├── remove-user.sh           # Remove user environment
 │   └── sleep-manager.sh         # Idle container management
 ├── tests/
 │   └── e2e/                     # Playwright E2E tests
@@ -253,6 +254,55 @@ make test
 - **OS**: Ubuntu 24.04 LTS
 - **Includes**: nvm, Python, Homebrew, Go
 - **Rationale**: Better compatibility than Alpine for development tools
+
+---
+
+## User Provisioning
+
+### Create a New User
+
+```bash
+# Usage: ./scripts/create-user.sh <company> <username> [--test] [--remote <host>]
+
+# Local execution (on server)
+./scripts/create-user.sh lemalogic alice
+./scripts/create-user.sh lemalogic bob --test
+
+# Remote execution (from your local machine via SSH)
+./scripts/create-user.sh lemalogic alice --remote 46.224.211.238
+./scripts/create-user.sh acme carol --remote boardroom.example.com --test
+```
+
+This creates:
+- Isolated Docker network: `{username}-network`
+- Proxy container with API keys: `{username}-{company}-proxy`
+- Console container (no API keys): `{username}-{company}-console`
+- Data directories: `/home/boardroom/data/{username}-console` and `/home/boardroom/data/{username}-proxy`
+- Auto-generated gateway token
+- Moltbot config pointing to user's own proxy
+
+### Remove a User
+
+```bash
+# Usage: ./scripts/remove-user.sh <company> <username> [--keep-data] [--force] [--remote <host>]
+
+# Local execution
+./scripts/remove-user.sh lemalogic alice
+./scripts/remove-user.sh lemalogic alice --force --keep-data
+
+# Remote execution
+./scripts/remove-user.sh lemalogic alice --remote 46.224.211.238 --force
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SSH_KEY` | `~/.ssh/hetzner-boardroom` | SSH key for remote execution |
+| `SSH_USER` | `root` | SSH user for remote execution |
+| `DATA_BASE_DIR` | `/home/boardroom/data` | Base directory for user data |
+| `CONSOLE_IMAGE` | `ghcr.io/lemalogic/boardroom-console:amd64` | Console Docker image |
+| `PROXY_IMAGE` | `boardroom-api-proxy:latest` | Proxy Docker image |
 
 ---
 

@@ -4,12 +4,12 @@
 #
 # Stops and removes Docker containers, network, and optionally data for a user.
 #
-# Usage: ./remove-user.sh <username> [--keep-data] [--force] [--remote <host>]
+# Usage: ./remove-user.sh <company> <username> [--keep-data] [--force] [--remote <host>]
 #
 # Naming Convention:
 #   Network:   {username}-network
-#   Console:   {username}-lemalogic-console
-#   Proxy:     {username}-lemalogic-proxy
+#   Console:   {username}-{company}-console
+#   Proxy:     {username}-{company}-proxy
 #   Data:      /home/boardroom/data/{username}-console
 #              /home/boardroom/data/{username}-proxy
 #
@@ -20,7 +20,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 DATA_BASE_DIR="${DATA_BASE_DIR:-/home/boardroom/data}"
-COMPANY="${COMPANY:-lemalogic}"
+COMPANY=""  # Required argument
 
 # Remote execution
 REMOTE_HOST=""
@@ -86,12 +86,13 @@ log_error() {
 # Display usage information
 usage() {
     cat << EOF
-Usage: $(basename "$0") <username> [options]
+Usage: $(basename "$0") <company> <username> [options]
 
 Remove a Boardroom user environment and its Docker resources.
 
 Arguments:
-    username            The username of the environment to remove
+    company             Company/org identifier (e.g., lemalogic, acme)
+    username            Username of the environment to remove
 
 Options:
     --keep-data         Keep data directories (don't delete user data)
@@ -101,19 +102,18 @@ Options:
 
 Environment Variables:
     DATA_BASE_DIR   Base directory for user data (default: /home/boardroom/data)
-    COMPANY         Company identifier (default: lemalogic)
     SSH_KEY         SSH key for remote execution (default: ~/.ssh/hetzner-boardroom)
     SSH_USER        SSH user for remote execution (default: root)
 
 Examples:
     # Local execution
-    $(basename "$0") alice                  # Remove with confirmation
-    $(basename "$0") alice --force          # Remove without confirmation
-    $(basename "$0") alice --keep-data      # Remove containers but keep data
+    $(basename "$0") lemalogic alice                  # Remove with confirmation
+    $(basename "$0") lemalogic alice --force          # Remove without confirmation
+    $(basename "$0") lemalogic alice --keep-data      # Remove containers but keep data
 
     # Remote execution
-    $(basename "$0") alice --remote 46.224.211.238
-    $(basename "$0") alice --remote boardroom.example.com --force
+    $(basename "$0") lemalogic alice --remote 46.224.211.238
+    $(basename "$0") acme bob --remote boardroom.example.com --force
 EOF
     exit 1
 }
@@ -396,6 +396,7 @@ main() {
     local username=""
     local keep_data=false
     local force=false
+    local positional_args=()
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -424,28 +425,37 @@ main() {
                 usage
                 ;;
             *)
-                if [[ -z "$username" ]]; then
-                    username="$1"
-                else
-                    log_error "Unexpected argument: $1"
-                    usage
-                fi
+                positional_args+=("$1")
                 shift
                 ;;
         esac
     done
 
-    # Validate arguments
-    if [[ -z "$username" ]]; then
-        log_error "Missing required argument: username"
+    # Extract company and username from positional args
+    if [[ ${#positional_args[@]} -lt 2 ]]; then
+        log_error "Missing required arguments: company and username"
         echo ""
+        echo "Usage: $(basename "$0") <company> <username> [--force] [--keep-data] [--remote <host>]"
+        echo ""
+        echo "Example: $(basename "$0") lemalogic alice --remote 46.224.211.238"
+        exit 1
+    fi
+
+    if [[ ${#positional_args[@]} -gt 2 ]]; then
+        log_error "Too many positional arguments"
         usage
     fi
+
+    COMPANY="${positional_args[0]}"
+    username="${positional_args[1]}"
 
     # Show remote mode info
     if [[ -n "$REMOTE_HOST" ]]; then
         log_info "Remote mode: executing on ${REMOTE_HOST} via SSH"
     fi
+
+    log_info "Company: ${COMPANY}"
+    log_info "Username: ${username}"
 
     # Pre-flight checks
     check_docker

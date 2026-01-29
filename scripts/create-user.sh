@@ -5,12 +5,12 @@
 # Creates isolated Docker network, console container, and proxy container for a user.
 # Each user gets their own proxy for complete API key isolation.
 #
-# Usage: ./create-user.sh <username> [--test] [--remote <host>]
+# Usage: ./create-user.sh <company> <username> [--test] [--remote <host>]
 #
 # Naming Convention:
 #   Network:   {username}-network
-#   Console:   {username}-lemalogic-console
-#   Proxy:     {username}-lemalogic-proxy
+#   Console:   {username}-{company}-console
+#   Proxy:     {username}-{company}-proxy
 #   Data:      /home/boardroom/data/{username}-console
 #              /home/boardroom/data/{username}-proxy
 #
@@ -23,8 +23,7 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 DATA_BASE_DIR="${DATA_BASE_DIR:-/home/boardroom/data}"
 CONSOLE_IMAGE="${CONSOLE_IMAGE:-ghcr.io/lemalogic/boardroom-console:amd64}"
 PROXY_IMAGE="${PROXY_IMAGE:-boardroom-api-proxy:latest}"
-CLOUDFLARE_DOMAIN="${CLOUDFLARE_DOMAIN:-lemalogic.boardroom.site}"
-COMPANY="${COMPANY:-lemalogic}"
+COMPANY=""  # Required argument
 
 # Remote execution
 REMOTE_HOST=""
@@ -100,12 +99,13 @@ log_error() {
 # Display usage information
 usage() {
     cat << EOF
-Usage: $(basename "$0") <username> [--test] [--remote <host>]
+Usage: $(basename "$0") <company> <username> [--test] [--remote <host>]
 
 Create a new Boardroom user environment with isolated Docker containers.
 
 Arguments:
-    username            The username for the new environment (lowercase alphanumeric and hyphens)
+    company             Company/org identifier (e.g., lemalogic, acme)
+    username            Username for the new environment (lowercase alphanumeric and hyphens)
 
 Options:
     --test              Run end-to-end test after creation
@@ -116,32 +116,58 @@ Environment Variables:
     DATA_BASE_DIR       Base directory for user data (default: /home/boardroom/data)
     CONSOLE_IMAGE       Docker image for console (default: ghcr.io/lemalogic/boardroom-console:amd64)
     PROXY_IMAGE         Docker image for proxy (default: boardroom-api-proxy:latest)
-    CLOUDFLARE_DOMAIN   Base domain for Cloudflare Tunnel (default: lemalogic.boardroom.site)
-    COMPANY             Company identifier (default: lemalogic)
     SSH_KEY             SSH key for remote execution (default: ~/.ssh/hetzner-boardroom)
     SSH_USER            SSH user for remote execution (default: root)
 
 Examples:
     # Local execution (on server)
-    $(basename "$0") alice
-    $(basename "$0") bob --test
+    $(basename "$0") lemalogic alice
+    $(basename "$0") lemalogic bob --test
 
     # Remote execution (from local machine)
-    $(basename "$0") alice --remote 46.224.211.238
-    $(basename "$0") bob --remote boardroom.example.com --test
+    $(basename "$0") lemalogic alice --remote 46.224.211.238
+    $(basename "$0") acme carol --remote boardroom.example.com --test
 
     # Custom SSH key
-    SSH_KEY=~/.ssh/my-key $(basename "$0") carol --remote 10.0.0.5
+    SSH_KEY=~/.ssh/my-key $(basename "$0") lemalogic dan --remote 10.0.0.5
 
 Architecture:
     Each user gets:
     - Isolated Docker network ({username}-network)
-    - Dedicated proxy container with API keys ({username}-lemalogic-proxy)
-    - Console container without API keys ({username}-lemalogic-console)
+    - Dedicated proxy container with API keys ({username}-{company}-proxy)
+    - Console container without API keys ({username}-{company}-console)
 
     The console can ONLY communicate with its own proxy (network isolation).
+
+Container Naming:
+    company=lemalogic, username=alice creates:
+    - alice-network
+    - alice-lemalogic-console
+    - alice-lemalogic-proxy
 EOF
     exit 1
+}
+
+# Validate company format
+validate_company() {
+    local company="$1"
+
+    if [[ -z "$company" ]]; then
+        log_error "Company cannot be empty"
+        return 1
+    fi
+
+    if [[ ! "$company" =~ ^[a-z][a-z0-9_-]*$ ]]; then
+        log_error "Company must start with a letter and contain only lowercase letters, numbers, hyphens, and underscores"
+        return 1
+    fi
+
+    if [[ ${#company} -gt 16 ]]; then
+        log_error "Company must be 16 characters or less"
+        return 1
+    fi
+
+    return 0
 }
 
 # Validate username format
@@ -153,8 +179,8 @@ validate_username() {
         return 1
     fi
 
-    if [[ ! "$username" =~ ^[a-z][a-z0-9-]*$ ]]; then
-        log_error "Username must start with a letter and contain only lowercase letters, numbers, and hyphens"
+    if [[ ! "$username" =~ ^[a-z][a-z0-9_-]*$ ]]; then
+        log_error "Username must start with a letter and contain only lowercase letters, numbers, hyphens, and underscores"
         return 1
     fi
 
@@ -391,7 +417,7 @@ start_containers() {
 # Configure Cloudflare Tunnel route
 configure_cloudflare_tunnel() {
     local username="$1"
-    local subdomain="${username}-${COMPANY}.${CLOUDFLARE_DOMAIN%%.*}.site"
+    local subdomain="${username}-${COMPANY}.boardroom.site"
 
     log_info "Cloudflare Tunnel configuration required"
 
@@ -475,7 +501,7 @@ run_test() {
 display_summary() {
     local username="$1"
     local gateway_token="$2"
-    local subdomain="${username}-${COMPANY}.${CLOUDFLARE_DOMAIN%%.*}.site"
+    local subdomain="${username}-${COMPANY}.boardroom.site"
 
     echo ""
     echo "=============================================="
@@ -523,8 +549,10 @@ main() {
         usage
     fi
 
-    # Parse arguments
+    # Parse arguments - company and username are positional
     local username=""
+    local positional_args=()
+
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --test)
@@ -547,21 +575,37 @@ main() {
                 usage
                 ;;
             *)
-                if [[ -z "$username" ]]; then
-                    username="$1"
-                else
-                    log_error "Too many arguments"
-                    usage
-                fi
+                positional_args+=("$1")
                 shift
                 ;;
         esac
     done
 
-    if [[ -z "$username" ]]; then
-        log_error "Missing required argument: username"
+    # Extract company and username from positional args
+    if [[ ${#positional_args[@]} -lt 2 ]]; then
+        log_error "Missing required arguments: company and username"
         echo ""
+        echo "Usage: $(basename "$0") <company> <username> [--test] [--remote <host>]"
+        echo ""
+        echo "Example: $(basename "$0") lemalogic alice --remote 46.224.211.238"
+        exit 1
+    fi
+
+    if [[ ${#positional_args[@]} -gt 2 ]]; then
+        log_error "Too many positional arguments"
         usage
+    fi
+
+    COMPANY="${positional_args[0]}"
+    username="${positional_args[1]}"
+
+    # Validate inputs
+    if ! validate_company "$COMPANY"; then
+        exit 1
+    fi
+
+    if ! validate_username "$username"; then
+        exit 1
     fi
 
     # Show remote mode info
@@ -570,10 +614,8 @@ main() {
         log_info "SSH key: ${SSH_KEY}"
     fi
 
-    # Validate username
-    if ! validate_username "$username"; then
-        exit 1
-    fi
+    log_info "Company: ${COMPANY}"
+    log_info "Username: ${username}"
 
     # Pre-flight checks
     check_docker
