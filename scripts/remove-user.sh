@@ -2,9 +2,16 @@
 #
 # remove-user.sh - Remove a Boardroom user environment
 #
-# Stops and removes Docker containers, network, and optionally volumes for a user.
+# Stops and removes Docker containers, network, and optionally data for a user.
 #
-# Usage: ./remove-user.sh <username> [--keep-data] [--force]
+# Usage: ./remove-user.sh <username> [--keep-data] [--force] [--remote <host>]
+#
+# Naming Convention:
+#   Network:   {username}-network
+#   Console:   {username}-lemalogic-console
+#   Proxy:     {username}-lemalogic-proxy
+#   Data:      /home/boardroom/data/{username}-console
+#              /home/boardroom/data/{username}-proxy
 #
 
 set -euo pipefail
@@ -12,8 +19,45 @@ set -euo pipefail
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-LOG_BASE_DIR="${PROJECT_ROOT}/data/logs"
-CONFIG_BASE_DIR="${PROJECT_ROOT}/data/config"
+DATA_BASE_DIR="${DATA_BASE_DIR:-/home/boardroom/data}"
+COMPANY="${COMPANY:-lemalogic}"
+
+# Remote execution
+REMOTE_HOST=""
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/hetzner-boardroom}"
+SSH_USER="${SSH_USER:-root}"
+
+# Execute command locally or remotely
+run_cmd() {
+    if [[ -n "$REMOTE_HOST" ]]; then
+        ssh -i "$SSH_KEY" "${SSH_USER}@${REMOTE_HOST}" "$@"
+    else
+        eval "$@"
+    fi
+}
+
+# Execute docker command
+docker_cmd() {
+    run_cmd "docker $*"
+}
+
+# Remove directory
+remove_dir() {
+    local dirpath="$1"
+    run_cmd "rm -rf '$dirpath'"
+}
+
+# Check if directory exists
+dir_exists() {
+    local dirpath="$1"
+    run_cmd "test -d '$dirpath'" 2>/dev/null
+}
+
+# Get directory size
+dir_size() {
+    local dirpath="$1"
+    run_cmd "du -sh '$dirpath' 2>/dev/null | cut -f1" || echo "unknown"
+}
 
 # Colors for output
 RED='\033[0;31m'
@@ -47,26 +91,40 @@ Usage: $(basename "$0") <username> [options]
 Remove a Boardroom user environment and its Docker resources.
 
 Arguments:
-    username        The username of the environment to remove
+    username            The username of the environment to remove
 
 Options:
-    --keep-data     Keep log and config directories (don't delete user data)
-    --force, -f     Skip confirmation prompt
-    --help, -h      Show this help message
+    --keep-data         Keep data directories (don't delete user data)
+    --force, -f         Skip confirmation prompt
+    --remote <host>     Execute on remote server via SSH
+    --help, -h          Show this help message
+
+Environment Variables:
+    DATA_BASE_DIR   Base directory for user data (default: /home/boardroom/data)
+    COMPANY         Company identifier (default: lemalogic)
+    SSH_KEY         SSH key for remote execution (default: ~/.ssh/hetzner-boardroom)
+    SSH_USER        SSH user for remote execution (default: root)
 
 Examples:
-    $(basename "$0") john-doe                  # Remove with confirmation
-    $(basename "$0") john-doe --force          # Remove without confirmation
-    $(basename "$0") john-doe --keep-data      # Remove containers but keep data
-    $(basename "$0") john-doe -f --keep-data   # Both options combined
+    # Local execution
+    $(basename "$0") alice                  # Remove with confirmation
+    $(basename "$0") alice --force          # Remove without confirmation
+    $(basename "$0") alice --keep-data      # Remove containers but keep data
+
+    # Remote execution
+    $(basename "$0") alice --remote 46.224.211.238
+    $(basename "$0") alice --remote boardroom.example.com --force
 EOF
     exit 1
 }
 
 # Check if Docker is running
 check_docker() {
-    if ! docker info &>/dev/null; then
+    if ! docker_cmd info &>/dev/null; then
         log_error "Docker is not running or not accessible"
+        if [[ -n "$REMOTE_HOST" ]]; then
+            log_error "Check SSH connection to ${REMOTE_HOST}"
+        fi
         exit 1
     fi
 }
@@ -74,26 +132,29 @@ check_docker() {
 # Check if user environment exists
 check_exists() {
     local username="$1"
-    local network_name="boardroom-${username}-network"
-    local console_name="boardroom-${username}-console"
-    local proxy_name="boardroom-${username}-proxy"
+    local network_name="${username}-network"
+    local console_name="${username}-${COMPANY}-console"
+    local proxy_name="${username}-${COMPANY}-proxy"
 
     local exists=false
 
-    if docker network inspect "$network_name" &>/dev/null; then
+    if docker_cmd "network inspect '${network_name}'" &>/dev/null; then
         exists=true
     fi
 
-    if docker container inspect "$console_name" &>/dev/null; then
+    if docker_cmd "container inspect '${console_name}'" &>/dev/null; then
         exists=true
     fi
 
-    if docker container inspect "$proxy_name" &>/dev/null; then
+    if docker_cmd "container inspect '${proxy_name}'" &>/dev/null; then
         exists=true
     fi
 
     if [[ "$exists" == "false" ]]; then
         log_error "No user environment found for: ${username}"
+        log_error "Expected network: ${network_name}"
+        log_error "Expected console: ${console_name}"
+        log_error "Expected proxy: ${proxy_name}"
         exit 1
     fi
 }
@@ -101,56 +162,56 @@ check_exists() {
 # Display current state of user resources
 display_current_state() {
     local username="$1"
-    local network_name="boardroom-${username}-network"
-    local console_name="boardroom-${username}-console"
-    local proxy_name="boardroom-${username}-proxy"
-    local log_dir="${LOG_BASE_DIR}/${username}"
-    local config_dir="${CONFIG_BASE_DIR}/${username}"
+    local network_name="${username}-network"
+    local console_name="${username}-${COMPANY}-console"
+    local proxy_name="${username}-${COMPANY}-proxy"
+    local console_dir="${DATA_BASE_DIR}/${username}-console"
+    local proxy_dir="${DATA_BASE_DIR}/${username}-proxy"
 
     echo ""
     echo "Current state for user: ${username}"
     echo "----------------------------------------"
 
     # Check network
-    if docker network inspect "$network_name" &>/dev/null; then
-        echo -e "Network:    ${GREEN}exists${NC} - ${network_name}"
+    if docker_cmd "network inspect '${network_name}'" &>/dev/null; then
+        echo -e "Network:     ${GREEN}exists${NC} - ${network_name}"
     else
-        echo -e "Network:    ${YELLOW}not found${NC} - ${network_name}"
+        echo -e "Network:     ${YELLOW}not found${NC} - ${network_name}"
     fi
 
     # Check console container
-    if docker container inspect "$console_name" &>/dev/null; then
+    if docker_cmd "container inspect '${console_name}'" &>/dev/null; then
         local state
-        state=$(docker container inspect -f '{{.State.Status}}' "$console_name" 2>/dev/null || echo "unknown")
-        echo -e "Console:    ${GREEN}exists${NC} (${state}) - ${console_name}"
+        state=$(docker_cmd "container inspect -f '{{.State.Status}}' '${console_name}'" 2>/dev/null || echo "unknown")
+        echo -e "Console:     ${GREEN}exists${NC} (${state}) - ${console_name}"
     else
-        echo -e "Console:    ${YELLOW}not found${NC} - ${console_name}"
+        echo -e "Console:     ${YELLOW}not found${NC} - ${console_name}"
     fi
 
     # Check proxy container
-    if docker container inspect "$proxy_name" &>/dev/null; then
+    if docker_cmd "container inspect '${proxy_name}'" &>/dev/null; then
         local state
-        state=$(docker container inspect -f '{{.State.Status}}' "$proxy_name" 2>/dev/null || echo "unknown")
-        echo -e "Proxy:      ${GREEN}exists${NC} (${state}) - ${proxy_name}"
+        state=$(docker_cmd "container inspect -f '{{.State.Status}}' '${proxy_name}'" 2>/dev/null || echo "unknown")
+        echo -e "Proxy:       ${GREEN}exists${NC} (${state}) - ${proxy_name}"
     else
-        echo -e "Proxy:      ${YELLOW}not found${NC} - ${proxy_name}"
+        echo -e "Proxy:       ${YELLOW}not found${NC} - ${proxy_name}"
     fi
 
     # Check data directories
-    if [[ -d "$log_dir" ]]; then
-        local log_size
-        log_size=$(du -sh "$log_dir" 2>/dev/null | cut -f1 || echo "unknown")
-        echo -e "Log dir:    ${GREEN}exists${NC} (${log_size}) - ${log_dir}"
+    if dir_exists "$console_dir"; then
+        local size
+        size=$(dir_size "$console_dir")
+        echo -e "Console dir: ${GREEN}exists${NC} (${size}) - ${console_dir}"
     else
-        echo -e "Log dir:    ${YELLOW}not found${NC} - ${log_dir}"
+        echo -e "Console dir: ${YELLOW}not found${NC} - ${console_dir}"
     fi
 
-    if [[ -d "$config_dir" ]]; then
-        local config_size
-        config_size=$(du -sh "$config_dir" 2>/dev/null | cut -f1 || echo "unknown")
-        echo -e "Config dir: ${GREEN}exists${NC} (${config_size}) - ${config_dir}"
+    if dir_exists "$proxy_dir"; then
+        local size
+        size=$(dir_size "$proxy_dir")
+        echo -e "Proxy dir:   ${GREEN}exists${NC} (${size}) - ${proxy_dir}"
     else
-        echo -e "Config dir: ${YELLOW}not found${NC} - ${config_dir}"
+        echo -e "Proxy dir:   ${YELLOW}not found${NC} - ${proxy_dir}"
     fi
 
     echo "----------------------------------------"
@@ -165,7 +226,7 @@ confirm_deletion() {
     echo -e "${YELLOW}WARNING: This will permanently remove the user environment for '${username}'${NC}"
 
     if [[ "$keep_data" == "false" ]]; then
-        echo -e "${YELLOW}WARNING: User data (logs and config) will also be deleted${NC}"
+        echo -e "${YELLOW}WARNING: User data (console and proxy dirs) will also be deleted${NC}"
     else
         echo -e "${BLUE}NOTE: User data will be preserved (--keep-data flag)${NC}"
     fi
@@ -187,32 +248,32 @@ confirm_deletion() {
 # Stop containers
 stop_containers() {
     local username="$1"
-    local console_name="boardroom-${username}-console"
-    local proxy_name="boardroom-${username}-proxy"
+    local console_name="${username}-${COMPANY}-console"
+    local proxy_name="${username}-${COMPANY}-proxy"
 
     log_info "Stopping containers..."
 
-    # Stop proxy first (depends on console)
-    if docker container inspect "$proxy_name" &>/dev/null; then
+    # Stop console first
+    if docker_cmd "container inspect '${console_name}'" &>/dev/null; then
         local state
-        state=$(docker container inspect -f '{{.State.Status}}' "$proxy_name" 2>/dev/null || echo "unknown")
+        state=$(docker_cmd "container inspect -f '{{.State.Status}}' '${console_name}'" 2>/dev/null || echo "unknown")
         if [[ "$state" == "running" ]]; then
-            docker stop "$proxy_name" >/dev/null 2>&1 || true
-            log_success "Stopped proxy container: ${proxy_name}"
-        else
-            log_info "Proxy container already stopped: ${proxy_name}"
-        fi
-    fi
-
-    # Stop console
-    if docker container inspect "$console_name" &>/dev/null; then
-        local state
-        state=$(docker container inspect -f '{{.State.Status}}' "$console_name" 2>/dev/null || echo "unknown")
-        if [[ "$state" == "running" ]]; then
-            docker stop "$console_name" >/dev/null 2>&1 || true
+            docker_cmd "stop '${console_name}'" >/dev/null 2>&1 || true
             log_success "Stopped console container: ${console_name}"
         else
             log_info "Console container already stopped: ${console_name}"
+        fi
+    fi
+
+    # Stop proxy
+    if docker_cmd "container inspect '${proxy_name}'" &>/dev/null; then
+        local state
+        state=$(docker_cmd "container inspect -f '{{.State.Status}}' '${proxy_name}'" 2>/dev/null || echo "unknown")
+        if [[ "$state" == "running" ]]; then
+            docker_cmd "stop '${proxy_name}'" >/dev/null 2>&1 || true
+            log_success "Stopped proxy container: ${proxy_name}"
+        else
+            log_info "Proxy container already stopped: ${proxy_name}"
         fi
     fi
 }
@@ -220,28 +281,28 @@ stop_containers() {
 # Remove containers
 remove_containers() {
     local username="$1"
-    local console_name="boardroom-${username}-console"
-    local proxy_name="boardroom-${username}-proxy"
+    local console_name="${username}-${COMPANY}-console"
+    local proxy_name="${username}-${COMPANY}-proxy"
     local removed_count=0
 
     log_info "Removing containers..."
 
-    # Remove proxy container
-    if docker container inspect "$proxy_name" &>/dev/null; then
-        docker rm "$proxy_name" >/dev/null 2>&1 || true
-        log_success "Removed proxy container: ${proxy_name}"
-        ((removed_count++))
-    else
-        log_info "Proxy container not found: ${proxy_name}"
-    fi
-
     # Remove console container
-    if docker container inspect "$console_name" &>/dev/null; then
-        docker rm "$console_name" >/dev/null 2>&1 || true
+    if docker_cmd "container inspect '${console_name}'" &>/dev/null; then
+        docker_cmd "rm '${console_name}'" >/dev/null 2>&1 || true
         log_success "Removed console container: ${console_name}"
         ((removed_count++))
     else
         log_info "Console container not found: ${console_name}"
+    fi
+
+    # Remove proxy container
+    if docker_cmd "container inspect '${proxy_name}'" &>/dev/null; then
+        docker_cmd "rm '${proxy_name}'" >/dev/null 2>&1 || true
+        log_success "Removed proxy container: ${proxy_name}"
+        ((removed_count++))
+    else
+        log_info "Proxy container not found: ${proxy_name}"
     fi
 
     echo "$removed_count"
@@ -250,12 +311,12 @@ remove_containers() {
 # Remove network
 remove_network() {
     local username="$1"
-    local network_name="boardroom-${username}-network"
+    local network_name="${username}-network"
 
     log_info "Removing network..."
 
-    if docker network inspect "$network_name" &>/dev/null; then
-        docker network rm "$network_name" >/dev/null 2>&1 || true
+    if docker_cmd "network inspect '${network_name}'" &>/dev/null; then
+        docker_cmd "network rm '${network_name}'" >/dev/null 2>&1 || true
         log_success "Removed network: ${network_name}"
         return 0
     else
@@ -267,26 +328,26 @@ remove_network() {
 # Remove data directories
 remove_data() {
     local username="$1"
-    local log_dir="${LOG_BASE_DIR}/${username}"
-    local config_dir="${CONFIG_BASE_DIR}/${username}"
+    local console_dir="${DATA_BASE_DIR}/${username}-console"
+    local proxy_dir="${DATA_BASE_DIR}/${username}-proxy"
     local removed_count=0
 
     log_info "Removing data directories..."
 
-    if [[ -d "$log_dir" ]]; then
-        rm -rf "$log_dir"
-        log_success "Removed log directory: ${log_dir}"
+    if dir_exists "$console_dir"; then
+        remove_dir "$console_dir"
+        log_success "Removed console directory: ${console_dir}"
         ((removed_count++))
     else
-        log_info "Log directory not found: ${log_dir}"
+        log_info "Console directory not found: ${console_dir}"
     fi
 
-    if [[ -d "$config_dir" ]]; then
-        rm -rf "$config_dir"
-        log_success "Removed config directory: ${config_dir}"
+    if dir_exists "$proxy_dir"; then
+        remove_dir "$proxy_dir"
+        log_success "Removed proxy directory: ${proxy_dir}"
         ((removed_count++))
     else
-        log_info "Config directory not found: ${config_dir}"
+        log_info "Proxy directory not found: ${proxy_dir}"
     fi
 
     echo "$removed_count"
@@ -321,8 +382,8 @@ display_summary() {
 
     if [[ "$keep_data" == "true" ]]; then
         echo "Note: User data was preserved. To remove it later:"
-        echo "  rm -rf ${LOG_BASE_DIR}/${username}"
-        echo "  rm -rf ${CONFIG_BASE_DIR}/${username}"
+        echo "  rm -rf ${DATA_BASE_DIR}/${username}-console"
+        echo "  rm -rf ${DATA_BASE_DIR}/${username}-proxy"
         echo ""
     fi
 
@@ -350,6 +411,14 @@ main() {
                 keep_data=true
                 shift
                 ;;
+            --remote)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "--remote requires a host argument"
+                    usage
+                fi
+                REMOTE_HOST="$2"
+                shift 2
+                ;;
             -*)
                 log_error "Unknown option: $1"
                 usage
@@ -371,6 +440,11 @@ main() {
         log_error "Missing required argument: username"
         echo ""
         usage
+    fi
+
+    # Show remote mode info
+    if [[ -n "$REMOTE_HOST" ]]; then
+        log_info "Remote mode: executing on ${REMOTE_HOST} via SSH"
     fi
 
     # Pre-flight checks
