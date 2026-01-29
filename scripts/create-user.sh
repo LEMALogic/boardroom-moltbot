@@ -670,6 +670,75 @@ configure_cloudflare_tunnel() {
 EOF
 }
 
+# Configure Cloudflare Access application
+configure_cloudflare_access() {
+    local username="$1"
+    local subdomain="${COMPANY}-${username}.boardroom.site"
+    local user_email="${USER_EMAIL:-${username}@${COMPANY}.com}"
+
+    # Check for Cloudflare credentials
+    local env_file="/Users/brian/Sites/github/boardroom/.env"
+    if [[ ! -f "$env_file" ]]; then
+        log_warn "Cloudflare .env file not found at $env_file"
+        log_warn "Skipping Cloudflare Access configuration"
+        return 0
+    fi
+
+    local cf_token=$(grep "^CLOUDFLARE_API_TOKEN=" "$env_file" | cut -d'=' -f2)
+    local cf_account=$(grep "^CLOUDFLARE_ACCOUNT_ID=" "$env_file" | cut -d'=' -f2)
+
+    if [[ -z "$cf_token" || -z "$cf_account" ]]; then
+        log_warn "Cloudflare credentials not found in .env"
+        log_warn "Skipping Cloudflare Access configuration"
+        return 0
+    fi
+
+    log_info "Creating Cloudflare Access application for $subdomain..."
+
+    # Create Access Application
+    local app_response=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/$cf_account/access/apps" \
+        -H "Authorization: Bearer $cf_token" \
+        -H "Content-Type: application/json" \
+        -d "{
+            \"name\": \"Boardroom - ${username} (${COMPANY}-${username})\",
+            \"domain\": \"${subdomain}\",
+            \"type\": \"self_hosted\",
+            \"session_duration\": \"24h\"
+        }")
+
+    local app_success=$(echo "$app_response" | jq -r '.success')
+    if [[ "$app_success" != "true" ]]; then
+        log_error "Failed to create Access application"
+        echo "$app_response" | jq .
+        return 1
+    fi
+
+    local app_id=$(echo "$app_response" | jq -r '.result.id')
+    log_success "Created Access application: $app_id"
+
+    # Create Access Policy
+    log_info "Creating Access policy for $user_email..."
+    local policy_response=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/$cf_account/access/apps/$app_id/policies" \
+        -H "Authorization: Bearer $cf_token" \
+        -H "Content-Type: application/json" \
+        -d "{
+            \"name\": \"Allow ${username}\",
+            \"decision\": \"allow\",
+            \"include\": [{\"email\": {\"email\": \"${user_email}\"}}],
+            \"precedence\": 1
+        }")
+
+    local policy_success=$(echo "$policy_response" | jq -r '.success')
+    if [[ "$policy_success" != "true" ]]; then
+        log_error "Failed to create Access policy"
+        echo "$policy_response" | jq .
+        return 1
+    fi
+
+    log_success "Created Access policy for $user_email"
+    log_info "Access app ID: $app_id (save this for removal)"
+}
+
 # Run end-to-end test
 run_test() {
     local username="$1"
@@ -922,6 +991,9 @@ main() {
 
     # Show Cloudflare config info
     configure_cloudflare_tunnel "$username"
+
+    # Configure Cloudflare Access (SSO protection)
+    configure_cloudflare_access "$username"
 }
 
 # Run main function

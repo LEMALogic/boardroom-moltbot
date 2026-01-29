@@ -7,11 +7,11 @@
 # Usage: ./remove-user.sh <company> <username> [--keep-data] [--force] [--remote <host>]
 #
 # Naming Convention:
-#   Network:   {username}-network
-#   Console:   {username}-{company}-console
-#   Proxy:     {username}-{company}-proxy
-#   Data:      /home/boardroom/data/{username}-console
-#              /home/boardroom/data/{username}-proxy
+#   Network:   {company}-{username}-network
+#   Console:   {company}-{username}-console
+#   Proxy:     {company}-{username}-proxy
+#   Data:      /home/boardroom/data/{company}-{username}-console
+#              /home/boardroom/data/{company}-{username}-proxy
 #
 
 set -euo pipefail
@@ -21,6 +21,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 DATA_BASE_DIR="${DATA_BASE_DIR:-/home/boardroom/data}"
 COMPANY=""  # Required argument
+
+# OpenRouter API key management
+OPENROUTER_PROVISIONING_KEY="${OPENROUTER_PROVISIONING_KEY:-}"
+OPENROUTER_API_BASE="https://openrouter.ai/api/v1/keys"
 
 # Remote execution (uses ~/.ssh/config for host resolution)
 REMOTE_HOST=""
@@ -82,6 +86,87 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1" >&2
 }
 
+# =============================================================================
+# OpenRouter API Key Management
+# =============================================================================
+
+# Check if OpenRouter provisioning is available
+openrouter_available() {
+    [[ -n "$OPENROUTER_PROVISIONING_KEY" ]]
+}
+
+# Get OpenRouter key name for this user
+get_openrouter_key_name() {
+    local username="$1"
+    echo "${COMPANY}-${username}-boardroom"
+}
+
+# Get OpenRouter key hash by name
+openrouter_get_key_hash() {
+    local key_name="$1"
+    local response hash
+
+    response=$(curl -s "$OPENROUTER_API_BASE" \
+        -H "Authorization: Bearer $OPENROUTER_PROVISIONING_KEY" 2>/dev/null)
+
+    if [[ -z "$response" ]]; then
+        return 1
+    fi
+
+    # Extract hash for key with matching name
+    hash=$(echo "$response" | jq -r --arg name "$key_name" \
+        '.data[] | select(.name == $name) | .hash' 2>/dev/null)
+
+    if [[ -n "$hash" && "$hash" != "null" ]]; then
+        echo "$hash"
+        return 0
+    fi
+    return 1
+}
+
+# Disable OpenRouter key (does NOT delete - can be re-enabled later)
+openrouter_disable_key() {
+    local key_hash="$1"
+
+    curl -s -X PATCH "${OPENROUTER_API_BASE}/${key_hash}" \
+        -H "Authorization: Bearer $OPENROUTER_PROVISIONING_KEY" \
+        -H "Content-Type: application/json" \
+        -d '{"disabled": true}' 2>/dev/null
+}
+
+# Disable OpenRouter API key for user (not delete - preserves for reactivation)
+disable_openrouter_key() {
+    local username="$1"
+    local key_name key_hash
+
+    if ! openrouter_available; then
+        log_warn "OPENROUTER_PROVISIONING_KEY not set, skipping OpenRouter key management"
+        return 1
+    fi
+
+    key_name=$(get_openrouter_key_name "$username")
+    log_info "Checking for OpenRouter key: ${key_name}"
+
+    if key_hash=$(openrouter_get_key_hash "$key_name"); then
+        log_info "Found OpenRouter key (hash: ${key_hash:0:8}...), disabling..."
+        if openrouter_disable_key "$key_hash"; then
+            log_success "Disabled OpenRouter API key: ${key_name}"
+            log_info "Key can be re-enabled when user is recreated"
+            return 0
+        else
+            log_warn "Failed to disable OpenRouter key"
+            return 1
+        fi
+    else
+        log_info "No OpenRouter key found for: ${key_name}"
+        return 1
+    fi
+}
+
+# =============================================================================
+# Usage and Help
+# =============================================================================
+
 # Display usage information
 usage() {
     cat << EOF
@@ -131,9 +216,9 @@ check_docker() {
 # Check if user environment exists
 check_exists() {
     local username="$1"
-    local network_name="${username}-network"
-    local console_name="${username}-${COMPANY}-console"
-    local proxy_name="${username}-${COMPANY}-proxy"
+    local network_name="${COMPANY}-${username}-network"
+    local console_name="${COMPANY}-${username}-console"
+    local proxy_name="${COMPANY}-${username}-proxy"
 
     local exists=false
 
@@ -150,7 +235,7 @@ check_exists() {
     fi
 
     if [[ "$exists" == "false" ]]; then
-        log_error "No user environment found for: ${username}"
+        log_error "No user environment found for: ${COMPANY}/${username}"
         log_error "Expected network: ${network_name}"
         log_error "Expected console: ${console_name}"
         log_error "Expected proxy: ${proxy_name}"
@@ -161,14 +246,14 @@ check_exists() {
 # Display current state of user resources
 display_current_state() {
     local username="$1"
-    local network_name="${username}-network"
-    local console_name="${username}-${COMPANY}-console"
-    local proxy_name="${username}-${COMPANY}-proxy"
-    local console_dir="${DATA_BASE_DIR}/${username}-console"
-    local proxy_dir="${DATA_BASE_DIR}/${username}-proxy"
+    local network_name="${COMPANY}-${username}-network"
+    local console_name="${COMPANY}-${username}-console"
+    local proxy_name="${COMPANY}-${username}-proxy"
+    local console_dir="${DATA_BASE_DIR}/${COMPANY}-${username}-console"
+    local proxy_dir="${DATA_BASE_DIR}/${COMPANY}-${username}-proxy"
 
     echo ""
-    echo "Current state for user: ${username}"
+    echo "Current state for user: ${COMPANY}/${username}"
     echo "----------------------------------------"
 
     # Check network
@@ -247,8 +332,8 @@ confirm_deletion() {
 # Stop containers
 stop_containers() {
     local username="$1"
-    local console_name="${username}-${COMPANY}-console"
-    local proxy_name="${username}-${COMPANY}-proxy"
+    local console_name="${COMPANY}-${username}-console"
+    local proxy_name="${COMPANY}-${username}-proxy"
 
     log_info "Stopping containers..."
 
@@ -280,8 +365,8 @@ stop_containers() {
 # Remove containers
 remove_containers() {
     local username="$1"
-    local console_name="${username}-${COMPANY}-console"
-    local proxy_name="${username}-${COMPANY}-proxy"
+    local console_name="${COMPANY}-${username}-console"
+    local proxy_name="${COMPANY}-${username}-proxy"
     local removed_count=0
 
     log_info "Removing containers..."
@@ -310,7 +395,7 @@ remove_containers() {
 # Remove network
 remove_network() {
     local username="$1"
-    local network_name="${username}-network"
+    local network_name="${COMPANY}-${username}-network"
 
     log_info "Removing network..."
 
@@ -327,8 +412,8 @@ remove_network() {
 # Remove data directories
 remove_data() {
     local username="$1"
-    local console_dir="${DATA_BASE_DIR}/${username}-console"
-    local proxy_dir="${DATA_BASE_DIR}/${username}-proxy"
+    local console_dir="${DATA_BASE_DIR}/${COMPANY}-${username}-console"
+    local proxy_dir="${DATA_BASE_DIR}/${COMPANY}-${username}-proxy"
     local removed_count=0
 
     log_info "Removing data directories..."
@@ -352,6 +437,59 @@ remove_data() {
     echo "$removed_count"
 }
 
+# Remove Cloudflare Access application
+remove_cloudflare_access() {
+    local username="$1"
+    local subdomain="${COMPANY}-${username}.boardroom.site"
+
+    # Check for Cloudflare credentials
+    local env_file="/Users/brian/Sites/github/boardroom/.env"
+    if [[ ! -f "$env_file" ]]; then
+        log_warn "Cloudflare .env file not found at $env_file"
+        log_warn "Skipping Cloudflare Access removal"
+        echo "skipped"
+        return 0
+    fi
+
+    local cf_token=$(grep "^CLOUDFLARE_API_TOKEN=" "$env_file" | cut -d'=' -f2)
+    local cf_account=$(grep "^CLOUDFLARE_ACCOUNT_ID=" "$env_file" | cut -d'=' -f2)
+
+    if [[ -z "$cf_token" || -z "$cf_account" ]]; then
+        log_warn "Cloudflare credentials not found in .env"
+        log_warn "Skipping Cloudflare Access removal"
+        echo "skipped"
+        return 0
+    fi
+
+    log_info "Looking for Cloudflare Access application for $subdomain..."
+
+    # Find Access app by domain
+    local apps_response=$(curl -s "https://api.cloudflare.com/client/v4/accounts/$cf_account/access/apps" \
+        -H "Authorization: Bearer $cf_token")
+
+    local app_id=$(echo "$apps_response" | jq -r ".result[] | select(.domain == \"$subdomain\") | .id")
+
+    if [[ -z "$app_id" || "$app_id" == "null" ]]; then
+        log_info "No Access application found for $subdomain"
+        echo "not_found"
+        return 0
+    fi
+
+    log_info "Deleting Access application: $app_id"
+    local delete_response=$(curl -s -X DELETE "https://api.cloudflare.com/client/v4/accounts/$cf_account/access/apps/$app_id" \
+        -H "Authorization: Bearer $cf_token")
+
+    local delete_success=$(echo "$delete_response" | jq -r '.success')
+    if [[ "$delete_success" == "true" ]]; then
+        log_success "Deleted Cloudflare Access application"
+        echo "yes"
+    else
+        log_error "Failed to delete Access application"
+        echo "$delete_response" | jq .
+        echo "failed"
+    fi
+}
+
 # Display cleanup summary
 display_summary() {
     local username="$1"
@@ -359,12 +497,15 @@ display_summary() {
     local network_removed="$3"
     local data_removed="$4"
     local keep_data="$5"
+    local openrouter_disabled="${6:-no}"
+    local access_removed="${7:-skipped}"
 
     echo ""
     echo "=============================================="
     echo -e "${GREEN}User Environment Removed Successfully${NC}"
     echo "=============================================="
     echo ""
+    echo "Company:             ${COMPANY}"
     echo "Username:            ${username}"
     echo ""
     echo "Cleanup Summary:"
@@ -377,12 +518,32 @@ display_summary() {
         echo "  Data dirs removed:  ${data_removed}"
     fi
 
+    if [[ "$openrouter_disabled" == "yes" ]]; then
+        echo -e "  OpenRouter key:     ${YELLOW}disabled (not deleted)${NC}"
+    fi
+
+    if [[ "$access_removed" == "yes" ]]; then
+        echo "  Access app removed: yes"
+    elif [[ "$access_removed" == "not_found" ]]; then
+        echo -e "  Access app:         ${YELLOW}not found${NC}"
+    elif [[ "$access_removed" == "skipped" ]]; then
+        echo -e "  Access app:         ${YELLOW}skipped (no credentials)${NC}"
+    elif [[ "$access_removed" == "failed" ]]; then
+        echo -e "  Access app:         ${RED}removal failed${NC}"
+    fi
+
     echo ""
 
     if [[ "$keep_data" == "true" ]]; then
-        echo "Note: User data was preserved. To remove it later:"
-        echo "  rm -rf ${DATA_BASE_DIR}/${username}-console"
-        echo "  rm -rf ${DATA_BASE_DIR}/${username}-proxy"
+        echo "Note: User data was preserved (git history intact). To remove it later:"
+        echo "  rm -rf ${DATA_BASE_DIR}/${COMPANY}-${username}-console"
+        echo "  rm -rf ${DATA_BASE_DIR}/${COMPANY}-${username}-proxy"
+        echo ""
+    fi
+
+    if [[ "$openrouter_disabled" == "yes" ]]; then
+        echo "Note: OpenRouter API key was disabled, not deleted."
+        echo "      If you recreate this user, the key will be automatically re-enabled."
         echo ""
     fi
 
@@ -471,6 +632,12 @@ main() {
     log_info "Removing user environment for: ${username}"
     echo ""
 
+    # Disable OpenRouter API key (does not delete - can be re-enabled)
+    local openrouter_disabled="no"
+    if disable_openrouter_key "$username"; then
+        openrouter_disabled="yes"
+    fi
+
     # Stop and remove containers
     stop_containers "$username"
     containers_removed=$(remove_containers "$username")
@@ -490,8 +657,11 @@ main() {
         log_info "Keeping data directories (--keep-data flag)"
     fi
 
+    # Remove Cloudflare Access application
+    access_removed=$(remove_cloudflare_access "$username")
+
     # Display summary
-    display_summary "$username" "$containers_removed" "$network_removed" "$data_removed" "$keep_data"
+    display_summary "$username" "$containers_removed" "$network_removed" "$data_removed" "$keep_data" "$openrouter_disabled" "$access_removed"
 }
 
 # Run main function

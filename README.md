@@ -73,12 +73,12 @@ Each user receives an isolated environment consisting of two containers on a pri
 │                                                                              │
 │   User: Dan Thomas                        User: Brian Gallagher              │
 │   ┌─────────────────────────────┐        ┌─────────────────────────────┐    │
-│   │  dan-network (isolated)     │        │  brian-network (isolated)   │    │
+│   │  lemalogic-dan-network      │        │  lemalogic-brian-network    │    │
 │   │                             │        │                             │    │
 │   │  ┌─────────┐  ┌──────────┐  │        │  ┌─────────┐  ┌──────────┐  │    │
+│   │  │ lema-   │  │ lema-    │  │        │  │ lema-   │  │ lema-    │  │    │
 │   │  │ dan-    │  │ dan-     │  │        │  │ brian-  │  │ brian-   │  │    │
 │   │  │ console │◄─┤ proxy    │  │        │  │ console │◄─┤ proxy    │  │    │
-│   │  │         │  │          │  │        │  │         │  │          │  │    │
 │   │  │ NO KEYS │  │ HAS KEYS │  │        │  │ NO KEYS │  │ HAS KEYS │  │    │
 │   │  └────┬────┘  └────┬─────┘  │        │  └────┬────┘  └────┬─────┘  │    │
 │   │       │            │        │        │       │            │        │    │
@@ -86,7 +86,7 @@ Each user receives an isolated environment consisting of two containers on a pri
 │           │            │                         │            │             │
 │   ┌───────┴────────────┴─────────────────────────┴────────────┴───────┐     │
 │   │                      cloudflared (shared)                          │     │
-│   │  dan.lemalogic.boardroom.site    brian.lemalogic.boardroom.site   │     │
+│   │  lemalogic-dan.boardroom.site    lemalogic-brian.boardroom.site   │     │
 │   └───────────────────────────────────────────────────────────────────┘     │
 └─────────────────────────────────────────────────────────────────────────────┘
                                       │
@@ -112,24 +112,26 @@ The console container:
 ### Container Naming Convention
 
 ```
-{username}-lemalogic-console
-{username}-lemalogic-proxy
-{username}-network
+{company}-{username}-console
+{company}-{username}-proxy
+{company}-{username}-network
 ```
 
-Example for Brian:
-- `brian-lemalogic-console` - Console container
-- `brian-lemalogic-proxy` - Proxy container (has API keys)
-- `brian-network` - Isolated Docker network
+Example for Brian at LEMA Logic:
+- `lemalogic-brian-console` - Console container
+- `lemalogic-brian-proxy` - Proxy container (has API keys)
+- `lemalogic-brian-network` - Isolated Docker network
+
+This naming groups containers by company when sorted alphabetically.
 
 ### URL Patterns
 
 | User | Console URL | Gateway Token |
 |------|-------------|---------------|
-| Brian Gallagher | `brian-lemalogic.boardroom.site` | Required in URL or settings |
-| Dan Thomas | `dan-lemalogic.boardroom.site` | Required in URL or settings |
+| Brian Gallagher | `lemalogic-brian.boardroom.site` | Required in URL or settings |
+| Dan Thomas | `lemalogic-dan.boardroom.site` | Required in URL or settings |
 
-**Access Pattern**: `https://{username}-lemalogic.boardroom.site/?token={gateway_token}`
+**Access Pattern**: `https://{company}-{username}.boardroom.site/` (protected by Cloudflare Access SSO)
 
 **SSH Access**: `ssh -p 2222 boardroom@{server-ip}` (Brian) or port 2223 (Dan)
 
@@ -200,9 +202,9 @@ IDLE_TIMEOUT_MINUTES=30
 ```yaml
 # docker-compose.yml example
 networks:
-  dan-network:
+  lemalogic-dan-network:
     driver: bridge
-  brian-network:
+  lemalogic-brian-network:
     driver: bridge
 ```
 
@@ -274,12 +276,41 @@ make test
 ```
 
 This creates:
-- Isolated Docker network: `{username}-network`
-- Proxy container with API keys: `{username}-{company}-proxy`
-- Console container (no API keys): `{username}-{company}-console`
-- Data directories: `/home/boardroom/data/{username}-console` and `/home/boardroom/data/{username}-proxy`
+- Isolated Docker network: `{company}-{username}-network`
+- Proxy container with API keys: `{company}-{username}-proxy`
+- Console container (no API keys): `{company}-{username}-console`
+- Git-versioned data directories: `/home/boardroom/data/{company}-{username}-console` and `/home/boardroom/data/{company}-{username}-proxy`
 - Auto-generated gateway token
 - Moltbot config pointing to user's own proxy
+- **OpenRouter API key** (if `OPENROUTER_PROVISIONING_KEY` is set) with $100/month default limit
+
+### OpenRouter API Key Provisioning
+
+When creating users, the script can automatically provision OpenRouter API keys:
+
+```bash
+# Set provisioning key (get from https://openrouter.ai/settings/provisioning-keys)
+export OPENROUTER_PROVISIONING_KEY="sk-or-v1-..."
+
+# Create user - OpenRouter key is auto-provisioned
+./scripts/create-user.sh lemalogic alice --remote boardroom.prod
+```
+
+**Key naming**: `{company}-{username}-boardroom` (e.g., `lemalogic-alice-boardroom`)
+
+**Features**:
+- **Auto-create**: New key created with $100/month spending limit
+- **Auto-reactivate**: If user is recreated, existing key is re-enabled
+- **Auto-disable**: When user is removed, key is disabled (not deleted) for reactivation
+
+**Check usage** via the proxy API:
+```bash
+# Get usage for default OpenRouter key
+curl http://proxy:8080/admin/openrouter/usage
+
+# Get usage for all OpenRouter aliases
+curl http://proxy:8080/admin/openrouter/usage/all
+```
 
 ### Remove a User
 
@@ -301,6 +332,7 @@ This creates:
 | `DATA_BASE_DIR` | `/home/boardroom/data` | Base directory for user data |
 | `CONSOLE_IMAGE` | `ghcr.io/lemalogic/boardroom-console:amd64` | Console Docker image |
 | `PROXY_IMAGE` | `boardroom-api-proxy:latest` | Proxy Docker image |
+| `OPENROUTER_PROVISIONING_KEY` | _(none)_ | OpenRouter provisioning key for auto API key creation |
 
 ### SSH Config Setup
 
@@ -314,6 +346,84 @@ Host boardroom.prod
 ```
 
 Then use `--remote boardroom.prod` with the scripts.
+
+---
+
+## Persistent Storage
+
+Each user's entire home directory is persisted to the host filesystem and initialized as a git repository for version control.
+
+### What Gets Persisted
+
+The console container's `/home/boardroom/` is mounted to `/home/boardroom/data/{company}-{username}-console/` on the host:
+
+| Directory | Contents | Versioned |
+|-----------|----------|-----------|
+| `.clawdbot-dev/` | Moltbot config, agents, history | ✅ Yes |
+| `.clawdbot/` | Moltbot runtime data | ✅ Yes |
+| `.moltbot/` | Moltbot data | ✅ Yes |
+| `clawd/`, `clawd-dev/` | Project work directories | ✅ Yes |
+| `.bashrc`, `.profile` | Shell customizations | ✅ Yes |
+| `.cache/`, `.npm/`, `.nvm/` | Caches and runtime | ❌ No (gitignored) |
+
+### Git Versioning
+
+Each user's data directory is initialized as a git repository on creation, allowing:
+- **History tracking** - See what changed and when
+- **Rollback** - Restore previous configurations
+- **Audit trail** - Track changes to agents and settings
+
+### Managing Versions
+
+```bash
+# View history
+cd /home/boardroom/data/lemalogic-brian-console
+git log --oneline
+
+# See recent changes
+git diff HEAD~1
+
+# Commit current state (manual checkpoint)
+git add -A && git commit -m "Updated agent configuration"
+
+# Rollback to previous state
+git checkout HEAD~1 -- .clawdbot-dev/agents/
+```
+
+### Automatic Commits (Recommended)
+
+Add a cron job to automatically commit changes daily:
+
+```bash
+# Add to crontab on host
+0 2 * * * cd /home/boardroom/data/lemalogic-brian-console && git add -A && git commit -m "Daily auto-commit $(date +%Y-%m-%d)" 2>/dev/null || true
+```
+
+### Backup Strategy
+
+Since data directories are git repositories, backup is straightforward:
+
+```bash
+# Push to remote (one-time setup)
+cd /home/boardroom/data/lemalogic-brian-console
+git remote add origin git@github.com:LEMALogic/boardroom-user-brian.git
+git push -u origin main
+
+# Automated backup via cron
+0 3 * * * cd /home/boardroom/data/lemalogic-brian-console && git push origin main 2>/dev/null || true
+```
+
+### Rebuild Without Data Loss
+
+Since data persists on the host, containers can be rebuilt without losing user data:
+
+```bash
+# Remove and recreate containers (data preserved)
+./scripts/remove-user.sh lemalogic brian --keep-data
+./scripts/create-user.sh lemalogic brian
+
+# User's agents, history, and config are all restored
+```
 
 ---
 
@@ -402,9 +512,38 @@ Recommended production hosting (GDPR compliant, best value at approximately 3.49
    ```
 
 4. **Configure Cloudflare Access** (SSO)
-   - Set up Access application in Cloudflare dashboard
-   - Configure identity providers (Google, GitHub, SAML, etc.)
-   - Apply policies to boardroom.site subdomain
+
+   The `create-user.sh` script automatically creates Access apps via API. Manual setup:
+
+   ```bash
+   # Get credentials
+   CF_TOKEN=$(grep "^CLOUDFLARE_API_TOKEN=" /path/to/.env | cut -d'=' -f2)
+   CF_ACCOUNT=$(grep "^CLOUDFLARE_ACCOUNT_ID=" /path/to/.env | cut -d'=' -f2)
+
+   # Create Access Application
+   curl -X POST "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/access/apps" \
+     -H "Authorization: Bearer $CF_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "name": "Boardroom - username",
+       "domain": "lemalogic-username.boardroom.site",
+       "type": "self_hosted",
+       "session_duration": "24h"
+     }'
+
+   # Create policy (use app ID from response)
+   curl -X POST "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/access/apps/{app_id}/policies" \
+     -H "Authorization: Bearer $CF_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "name": "Allow user",
+       "decision": "allow",
+       "include": [{"email": {"email": "user@company.com"}}],
+       "precedence": 1
+     }'
+   ```
+
+   The `remove-user.sh` script automatically removes Access apps when deleting users.
 
 ### Scaling Guidelines
 

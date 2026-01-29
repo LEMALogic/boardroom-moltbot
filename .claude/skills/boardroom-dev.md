@@ -208,9 +208,15 @@ The gateway config at `/home/boardroom/.clawdbot-dev/moltbot.json` should have:
 
 The `patches/apply-branding.sh` script makes these changes:
 - `MOLTBOT` → `BOARDROOM` (header)
-- `Gateway Dashboard` → `Boardroom Dashboard` (subtitle)
+- Subtitle shows user email from `BOARDROOM_USER_EMAIL` env var (falls back to "Boardroom Dashboard")
 - `Moltbot Control` → `Boardroom` (page title)
 - Removes lobster logo
+
+### User Email in Header
+The header displays the user's email (e.g., "brian@lemalogic.com") below "BOARDROOM".
+- Set via `BOARDROOM_USER_EMAIL` env var when creating container
+- Injected at container startup by `patches/inject-user-email.sh`
+- Use `--email` flag with `create-user.sh`: `./create-user.sh lemalogic bob --email bob@lemalogic.com`
 
 To add features (like logout button), modify `/app/moltbot/ui/src/ui/app-render.ts` in the container first, test, then update the patch script.
 
@@ -232,8 +238,61 @@ Examples:
 
 ## Access URLs
 
-- Brian: `https://lemalogic-brian.boardroom.site/?token=<token>`
-- Dan: `https://lemalogic-dan.boardroom.site/?token=<token>`
+- Brian: `https://lemalogic-brian.boardroom.site/`
+- Dan: `https://lemalogic-dan.boardroom.site/`
+
+**Note:** No `?token=` needed - authentication is via Cloudflare Access SSO.
+
+## Cloudflare Access Configuration
+
+Each user has a Cloudflare Access application protecting their dashboard:
+
+| User | Access App ID | Domain | Allowed Email |
+|------|---------------|--------|---------------|
+| Brian | `13d5330a-124b-4a96-bc94-701774dbf591` | lemalogic-brian.boardroom.site | brian@lemalogic.com |
+| Dan | `dbd1a554-00de-465b-aa7d-cf886d946c28` | lemalogic-dan.boardroom.site | dan@lemalogic.com |
+
+### Creating Access App for New User
+```bash
+# Get credentials from .env
+CF_TOKEN=$(grep "^CLOUDFLARE_API_TOKEN=" /Users/brian/Sites/github/boardroom/.env | cut -d'=' -f2)
+CF_ACCOUNT=$(grep "^CLOUDFLARE_ACCOUNT_ID=" /Users/brian/Sites/github/boardroom/.env | cut -d'=' -f2)
+
+# Create Access Application
+curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/access/apps" \
+  -H "Authorization: Bearer $CF_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Boardroom - <username>",
+    "domain": "lemalogic-<username>.boardroom.site",
+    "type": "self_hosted",
+    "session_duration": "24h"
+  }' | jq .
+
+# Note the app ID from response, then create policy
+APP_ID="<app-id-from-response>"
+curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/access/apps/$APP_ID/policies" \
+  -H "Authorization: Bearer $CF_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Allow <username>",
+    "decision": "allow",
+    "include": [{"email": {"email": "<user>@lemalogic.com"}}],
+    "precedence": 1
+  }' | jq .
+```
+
+### Listing Access Apps
+```bash
+curl -s "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/access/apps" \
+  -H "Authorization: Bearer $CF_TOKEN" | jq '.result[] | {id, name, domain}'
+```
+
+### Deleting Access App
+```bash
+curl -s -X DELETE "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/access/apps/<app-id>" \
+  -H "Authorization: Bearer $CF_TOKEN"
+```
 
 ## Docker Network Management
 
