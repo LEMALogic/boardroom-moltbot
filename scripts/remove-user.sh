@@ -22,15 +22,14 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 DATA_BASE_DIR="${DATA_BASE_DIR:-/home/boardroom/data}"
 COMPANY=""  # Required argument
 
-# Remote execution
+# Remote execution (uses ~/.ssh/config for host resolution)
 REMOTE_HOST=""
-SSH_KEY="${SSH_KEY:-$HOME/.ssh/hetzner-boardroom}"
-SSH_USER="${SSH_USER:-root}"
 
 # Execute command locally or remotely
+# Uses ~/.ssh/config for host resolution (HostName, User, IdentityFile)
 run_cmd() {
     if [[ -n "$REMOTE_HOST" ]]; then
-        ssh -i "$SSH_KEY" "${SSH_USER}@${REMOTE_HOST}" "$@"
+        ssh "$REMOTE_HOST" "$@"
     else
         eval "$@"
     fi
@@ -97,13 +96,11 @@ Arguments:
 Options:
     --keep-data         Keep data directories (don't delete user data)
     --force, -f         Skip confirmation prompt
-    --remote <host>     Execute on remote server via SSH
+    --remote <host>     Execute on remote server via SSH config host name
     --help, -h          Show this help message
 
 Environment Variables:
     DATA_BASE_DIR   Base directory for user data (default: /home/boardroom/data)
-    SSH_KEY         SSH key for remote execution (default: ~/.ssh/hetzner-boardroom)
-    SSH_USER        SSH user for remote execution (default: root)
 
 Examples:
     # Local execution
@@ -111,9 +108,11 @@ Examples:
     $(basename "$0") lemalogic alice --force          # Remove without confirmation
     $(basename "$0") lemalogic alice --keep-data      # Remove containers but keep data
 
-    # Remote execution
-    $(basename "$0") lemalogic alice --remote 46.224.211.238
-    $(basename "$0") acme bob --remote boardroom.example.com --force
+    # Remote execution using SSH config host name
+    $(basename "$0") lemalogic alice --remote boardroom.prod
+    $(basename "$0") acme bob --remote boardroom.prod --force
+
+    The --remote option uses ~/.ssh/config for host resolution.
 EOF
     exit 1
 }

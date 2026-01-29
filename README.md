@@ -262,15 +262,15 @@ make test
 ### Create a New User
 
 ```bash
-# Usage: ./scripts/create-user.sh <company> <username> [--test] [--remote <host>]
+# Usage: ./scripts/create-user.sh <company> <username> [--test] [--remote <ssh-host>]
 
 # Local execution (on server)
 ./scripts/create-user.sh lemalogic alice
 ./scripts/create-user.sh lemalogic bob --test
 
-# Remote execution (from your local machine via SSH)
-./scripts/create-user.sh lemalogic alice --remote 46.224.211.238
-./scripts/create-user.sh acme carol --remote boardroom.example.com --test
+# Remote execution using SSH config host name
+./scripts/create-user.sh lemalogic alice --remote boardroom.prod
+./scripts/create-user.sh acme carol --remote boardroom.prod --test
 ```
 
 This creates:
@@ -284,25 +284,36 @@ This creates:
 ### Remove a User
 
 ```bash
-# Usage: ./scripts/remove-user.sh <company> <username> [--keep-data] [--force] [--remote <host>]
+# Usage: ./scripts/remove-user.sh <company> <username> [--keep-data] [--force] [--remote <ssh-host>]
 
 # Local execution
 ./scripts/remove-user.sh lemalogic alice
 ./scripts/remove-user.sh lemalogic alice --force --keep-data
 
-# Remote execution
-./scripts/remove-user.sh lemalogic alice --remote 46.224.211.238 --force
+# Remote execution using SSH config host name
+./scripts/remove-user.sh lemalogic alice --remote boardroom.prod --force
 ```
 
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SSH_KEY` | `~/.ssh/hetzner-boardroom` | SSH key for remote execution |
-| `SSH_USER` | `root` | SSH user for remote execution |
 | `DATA_BASE_DIR` | `/home/boardroom/data` | Base directory for user data |
 | `CONSOLE_IMAGE` | `ghcr.io/lemalogic/boardroom-console:amd64` | Console Docker image |
 | `PROXY_IMAGE` | `boardroom-api-proxy:latest` | Proxy Docker image |
+
+### SSH Config Setup
+
+For remote execution, add an entry to `~/.ssh/config`:
+
+```
+Host boardroom.prod
+    HostName 46.224.211.238
+    User root
+    IdentityFile ~/.ssh/hetzner-boardroom
+```
+
+Then use `--remote boardroom.prod` with the scripts.
 
 ---
 

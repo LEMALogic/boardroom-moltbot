@@ -25,19 +25,18 @@ CONSOLE_IMAGE="${CONSOLE_IMAGE:-ghcr.io/lemalogic/boardroom-console:amd64}"
 PROXY_IMAGE="${PROXY_IMAGE:-boardroom-api-proxy:latest}"
 COMPANY=""  # Required argument
 
-# Remote execution
+# Remote execution (uses ~/.ssh/config for host resolution)
 REMOTE_HOST=""
-SSH_KEY="${SSH_KEY:-$HOME/.ssh/hetzner-boardroom}"
-SSH_USER="${SSH_USER:-root}"
 
 # SSH port allocation (start at 2224, brian=2222, dan=2223)
 SSH_PORT_BASE=2224
 GATEWAY_PORT_BASE=19003
 
 # Execute command locally or remotely
+# Uses ~/.ssh/config for host resolution (HostName, User, IdentityFile)
 run_cmd() {
     if [[ -n "$REMOTE_HOST" ]]; then
-        ssh -i "$SSH_KEY" "${SSH_USER}@${REMOTE_HOST}" "$@"
+        ssh "$REMOTE_HOST" "$@"
     else
         eval "$@"
     fi
@@ -99,37 +98,40 @@ log_error() {
 # Display usage information
 usage() {
     cat << EOF
-Usage: $(basename "$0") <company> <username> [--test] [--remote <host>]
+Usage: $(basename "$0") <company> <username> [--test] [--remote <ssh-host>]
 
 Create a new Boardroom user environment with isolated Docker containers.
 
 Arguments:
     company             Company/org identifier (e.g., lemalogic, acme)
-    username            Username for the new environment (lowercase alphanumeric and hyphens)
+    username            Username for the new environment (lowercase alphanumeric, hyphens, underscores)
 
 Options:
     --test              Run end-to-end test after creation
-    --remote <host>     Execute on remote server via SSH (e.g., --remote 46.224.211.238)
+    --remote <host>     Execute on remote server via SSH config host name
     --help, -h          Show this help message
 
 Environment Variables:
     DATA_BASE_DIR       Base directory for user data (default: /home/boardroom/data)
     CONSOLE_IMAGE       Docker image for console (default: ghcr.io/lemalogic/boardroom-console:amd64)
     PROXY_IMAGE         Docker image for proxy (default: boardroom-api-proxy:latest)
-    SSH_KEY             SSH key for remote execution (default: ~/.ssh/hetzner-boardroom)
-    SSH_USER            SSH user for remote execution (default: root)
 
 Examples:
     # Local execution (on server)
     $(basename "$0") lemalogic alice
     $(basename "$0") lemalogic bob --test
 
-    # Remote execution (from local machine)
-    $(basename "$0") lemalogic alice --remote 46.224.211.238
-    $(basename "$0") acme carol --remote boardroom.example.com --test
+    # Remote execution using SSH config host name
+    $(basename "$0") lemalogic alice --remote boardroom.prod
+    $(basename "$0") acme carol --remote boardroom.prod --test
 
-    # Custom SSH key
-    SSH_KEY=~/.ssh/my-key $(basename "$0") lemalogic dan --remote 10.0.0.5
+    The --remote option uses ~/.ssh/config for host resolution:
+
+    # Example ~/.ssh/config entry:
+    Host boardroom.prod
+        HostName 46.224.211.238
+        User root
+        IdentityFile ~/.ssh/hetzner-boardroom
 
 Architecture:
     Each user gets:
@@ -203,7 +205,7 @@ check_docker() {
     if ! docker_cmd info &>/dev/null; then
         log_error "Docker is not running or not accessible"
         if [[ -n "$REMOTE_HOST" ]]; then
-            log_error "Check SSH connection to ${REMOTE_HOST}"
+            log_error "Check SSH config for host '${REMOTE_HOST}' and ensure Docker is running on the remote server"
         fi
         exit 1
     fi
@@ -610,8 +612,7 @@ main() {
 
     # Show remote mode info
     if [[ -n "$REMOTE_HOST" ]]; then
-        log_info "Remote mode: executing on ${REMOTE_HOST} via SSH"
-        log_info "SSH key: ${SSH_KEY}"
+        log_info "Remote mode: executing on ${REMOTE_HOST} via SSH (using ~/.ssh/config)"
     fi
 
     log_info "Company: ${COMPANY}"
