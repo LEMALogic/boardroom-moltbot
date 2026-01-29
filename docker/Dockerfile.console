@@ -281,7 +281,8 @@ RUN mkdir -p /home/boardroom/.moltbot /home/boardroom/.clawdbot-dev && \
     "port": 19001,\
     "mode": "local",\
     "controlUi": {\
-      "dangerouslyDisableDeviceAuth": true\
+      "dangerouslyDisableDeviceAuth": true,\
+      "allowInsecureAuth": true\
     }\
   },\
   "models": {\

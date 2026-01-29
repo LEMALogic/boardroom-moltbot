@@ -42,10 +42,19 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# Page Title (Future)
+# Page Title
 # -----------------------------------------------------------------------------
-# TODO: Patch index.html or vite config to change page title from "Moltbot Control"
-# to "Boardroom Command Center"
+# Change browser tab title from "Moltbot Control" to "Boardroom - LEMA Logic"
+
+UI_INDEX_HTML="$MOLTBOT_DIR/ui/index.html"
+
+if [ -f "$UI_INDEX_HTML" ]; then
+    echo "  - Patching page title..."
+    sed -i 's/<title>Moltbot Control<\/title>/<title>Boardroom - LEMA Logic<\/title>/g' "$UI_INDEX_HTML"
+    echo "    Done: index.html"
+else
+    echo "  - Warning: $UI_INDEX_HTML not found, skipping page title"
+fi
 
 # -----------------------------------------------------------------------------
 # Logo/Favicon (Future)

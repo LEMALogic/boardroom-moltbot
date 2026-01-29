@@ -13,6 +13,7 @@ This document captures all significant architecture decisions for Boardroom-Molt
 5. [ADR-005: Cloudflare Tunnel for Access](#adr-005-cloudflare-tunnel-for-access)
 6. [ADR-006: File-Based Logging](#adr-006-file-based-logging)
 7. [ADR-007: Real LLM Tests Required](#adr-007-real-llm-tests-required)
+8. [ADR-008: No Gateway Token with Cloudflare Access](#adr-008-no-gateway-token-with-cloudflare-access)
 
 ---
 
@@ -72,10 +73,15 @@ Security research has identified critical vulnerabilities in single-tenant AI as
 
 ### Decision
 
-Deploy **isolated container pairs per user**:
-- `boardroom-{user}-console` - The AI assistant environment (NO API keys)
-- `boardroom-{user}-proxy` - API key management and request routing (HAS keys)
-- `boardroom-{user}-network` - Isolated Docker network connecting only the pair
+Deploy **isolated container pairs per user**, each with their own dedicated proxy:
+- `{user}-lemalogic-console` - The AI assistant environment (NO API keys)
+- `{user}-lemalogic-proxy` - API key management and request routing (HAS keys)
+- `{user}-network` - Isolated Docker network connecting only the user's pair
+
+**Critical**: Each user has their own proxy container. This prevents:
+- Cross-user API key access
+- Request/response logging visibility between users
+- Any shared state that could leak information
 
 ### Architecture
 
@@ -396,6 +402,79 @@ Mock tests cannot verify that:
 - Tests cost money (typically <$0.10 per run)
 - Tests are slower (~30s for LLM responses)
 - Tests may flake due to model non-determinism (mitigated with retries)
+
+---
+
+## ADR-008: No Gateway Token with Cloudflare Access
+
+**Status**: Accepted
+**Date**: 2026-01-28
+
+### Context
+
+Moltbot's Control UI has a built-in "gateway token" authentication mechanism that requires users to enter a secret token to connect to the websocket. This is designed for scenarios where the gateway is exposed directly or through basic reverse proxies.
+
+### Decision
+
+**Disable gateway token authentication** since Cloudflare Access provides superior authentication:
+- Set `dangerouslyDisableDeviceAuth: true`
+- Set `allowInsecureAuth: true`
+
+### Architecture with Cloudflare Access
+
+```
+User Browser
+      │
+      ▼ (1) Google SSO login
+┌─────────────────────┐
+│  Cloudflare Access  │  ← Identity verified here
+└─────────────────────┘
+      │
+      ▼ (2) JWT cookie set
+┌─────────────────────┐
+│  Cloudflare Tunnel  │  ← Only authenticated users reach here
+└─────────────────────┘
+      │
+      ▼ (3) Already authenticated
+┌─────────────────────┐
+│   Moltbot Gateway   │  ← No additional token needed
+└─────────────────────┘
+```
+
+### Why Gateway Token Adds No Value
+
+| Scenario | Without Cloudflare Access | With Cloudflare Access |
+|----------|--------------------------|----------------------|
+| Unauthenticated user tries to connect | Token blocks them | Cloudflare blocks them first |
+| Authenticated user connects | Must enter token manually | Direct access (better UX) |
+| Attacker bypasses Cloudflare | Token provides defense | If they bypass CF, they likely have container access anyway |
+
+The gateway token protects against a scenario where someone:
+1. Bypasses Cloudflare Tunnel AND Access (extremely difficult)
+2. BUT cannot read environment variables from the container (unlikely if step 1 succeeded)
+
+This is defense-in-depth for an implausible attack path while degrading UX for legitimate users.
+
+### Alternatives Considered
+
+| Alternative | Pros | Cons |
+|-------------|------|------|
+| **Keep gateway token** | Extra authentication layer | Redundant with CF Access; bad UX |
+| **Auto-inject token via Cloudflare** | Best of both | Complex; CF Access is sufficient |
+| **Remove token (chosen)** | Simple; great UX | Slightly reduced defense-in-depth |
+
+### Rationale
+
+1. **Cloudflare Access is the authentication boundary** - SSO verification before users can reach the gateway
+2. **Zero public exposure** - Containers are only accessible via Cloudflare Tunnel
+3. **UX improvement** - Users don't need to copy/paste tokens after already logging in via SSO
+4. **Principle of least friction** - Security should be invisible when possible
+
+### Consequences
+
+- Slightly reduced defense-in-depth (acceptable given Cloudflare Access)
+- Simpler user experience
+- Cleaner architecture (single auth boundary)
 
 ---
 

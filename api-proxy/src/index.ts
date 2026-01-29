@@ -861,6 +861,152 @@ app.post('/v1/redact', async (c) => {
   });
 });
 
+// =============================================================================
+// FORWARD PROXY ROUTES - Direct API forwarding with key injection
+// =============================================================================
+// These routes allow clients to call /proxy/{provider}/* and have requests
+// forwarded to the real API with the appropriate key injected.
+// This is simpler than MITM proxy for containerized deployments.
+
+// Helper to forward requests with key injection
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function forwardWithKey(
+  c: any,
+  targetHost: string,
+  targetPath: string,
+  aliasName?: string
+) {
+  // Find alias for this host
+  const alias = aliasName
+    ? getAliasByName(aliasName)
+    : getDefaultAliasForHost(targetHost);
+
+  if (!alias) {
+    return c.json({
+      error: `No API key configured for ${targetHost}`,
+      hint: 'Add an alias in the admin panel at /admin'
+    }, 503);
+  }
+
+  // Build target URL
+  const targetUrl = `https://${targetHost}${targetPath}`;
+
+  // Build headers - copy from original request, add auth
+  const headers: Record<string, string> = {};
+
+  // Copy relevant headers from original request
+  const originalHeaders = c.req.raw.headers;
+  for (const [key, value] of originalHeaders.entries()) {
+    // Skip hop-by-hop headers and host
+    if (!['host', 'connection', 'keep-alive', 'transfer-encoding', 'authorization'].includes(key.toLowerCase())) {
+      headers[key] = value;
+    }
+  }
+
+  // Add the API key
+  const authValue = (alias.authPrefix || '') + alias.key;
+  headers[alias.authHeader] = authValue;
+
+  // Add extra headers if configured
+  if (alias.extraHeaders) {
+    Object.assign(headers, alias.extraHeaders);
+  }
+
+  // Log the request
+  console.log(`[FORWARD] ${c.req.method} ${targetUrl} via alias "${alias.alias}"`);
+
+  // Update usage stats
+  alias.lastUsed = new Date().toISOString();
+  alias.usageCount = (alias.usageCount || 0) + 1;
+
+  try {
+    // Forward the request
+    const response = await fetch(targetUrl, {
+      method: c.req.method,
+      headers,
+      body: ['GET', 'HEAD'].includes(c.req.method) ? undefined : await c.req.raw.clone().text(),
+    });
+
+    // Log cost tracking
+    const responseClone = response.clone();
+    const responseBody = await responseClone.text();
+
+    // Try to parse for token usage
+    try {
+      const json = JSON.parse(responseBody);
+      if (json.usage) {
+        const entry: CostEntry = {
+          timestamp: new Date().toISOString(),
+          host: targetHost,
+          alias: alias.alias,
+          budget: alias.budget,
+          method: c.req.method,
+          path: targetPath,
+          inputTokens: json.usage.prompt_tokens,
+          outputTokens: json.usage.completion_tokens,
+          model: json.model,
+        };
+        // Estimate cost (rough OpenRouter pricing)
+        if (entry.inputTokens && entry.outputTokens) {
+          entry.estimatedCost = (entry.inputTokens * 0.000015) + (entry.outputTokens * 0.000075);
+        }
+        costLog.push(entry);
+        if (costLog.length > 1000) costLog.shift();
+      }
+    } catch {
+      // Not JSON or no usage info - that's OK
+    }
+
+    // Return the response
+    return new Response(responseBody, {
+      status: response.status,
+      headers: {
+        'content-type': response.headers.get('content-type') || 'application/json',
+      },
+    });
+  } catch (err) {
+    console.error(`[FORWARD] Error forwarding to ${targetUrl}:`, err);
+    return c.json({
+      error: 'Failed to forward request',
+      details: err instanceof Error ? err.message : String(err)
+    }, 502);
+  }
+}
+
+// OpenRouter forward proxy
+app.all('/proxy/openrouter/*', async (c) => {
+  const path = c.req.path.replace('/proxy/openrouter', '/api/v1');
+  return forwardWithKey(c, 'openrouter.ai', path);
+});
+
+// Also support /v1/openrouter/* for backwards compatibility with moltbot config
+app.all('/v1/openrouter/*', async (c) => {
+  const path = c.req.path.replace('/v1/openrouter', '/api/v1');
+  return forwardWithKey(c, 'openrouter.ai', path);
+});
+
+// Anthropic forward proxy
+app.all('/proxy/anthropic/*', async (c) => {
+  const path = c.req.path.replace('/proxy/anthropic', '');
+  return forwardWithKey(c, 'api.anthropic.com', path);
+});
+
+app.all('/v1/anthropic/*', async (c) => {
+  const path = c.req.path.replace('/v1/anthropic', '');
+  return forwardWithKey(c, 'api.anthropic.com', path);
+});
+
+// OpenAI forward proxy
+app.all('/proxy/openai/*', async (c) => {
+  const path = c.req.path.replace('/proxy/openai', '');
+  return forwardWithKey(c, 'api.openai.com', path);
+});
+
+app.all('/v1/openai/*', async (c) => {
+  const path = c.req.path.replace('/v1/openai', '');
+  return forwardWithKey(c, 'api.openai.com', path);
+});
+
 // 404 handler
 app.notFound((c) => {
   return c.json({ error: 'Not found', path: c.req.path }, 404);

@@ -112,20 +112,26 @@ The console container:
 ### Container Naming Convention
 
 ```
-boardroom-{username}-console
-boardroom-{username}-proxy
-boardroom-{username}-network
+{username}-lemalogic-console
+{username}-lemalogic-proxy
+{username}-network
 ```
+
+Example for Brian:
+- `brian-lemalogic-console` - Console container
+- `brian-lemalogic-proxy` - Proxy container (has API keys)
+- `brian-network` - Isolated Docker network
 
 ### URL Patterns
 
-| User | Console URL | SSH Host |
-|------|-------------|----------|
-| Dan Thomas | `dan.lemalogic.boardroom.site` | `ssh.dan.lemalogic.boardroom.site` |
-| Brian Gallagher | `brian.lemalogic.boardroom.site` | `ssh.brian.lemalogic.boardroom.site` |
-| Demo | `demo.lemalogic.boardroom.site` | `ssh.demo.lemalogic.boardroom.site` |
+| User | Console URL | Gateway Token |
+|------|-------------|---------------|
+| Brian Gallagher | `brian-lemalogic.boardroom.site` | Required in URL or settings |
+| Dan Thomas | `dan-lemalogic.boardroom.site` | Required in URL or settings |
 
-**Pattern**: `{username}.{company}.boardroom.site`
+**Access Pattern**: `https://{username}-lemalogic.boardroom.site/?token={gateway_token}`
+
+**SSH Access**: `ssh -p 2222 boardroom@{server-ip}` (Brian) or port 2223 (Dan)
 
 ---
 

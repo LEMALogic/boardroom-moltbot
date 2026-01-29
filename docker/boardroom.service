@@ -1,0 +1,28 @@
+[Unit]
+Description=Boardroom Multi-Tenant AI Assistant
+Documentation=https://github.com/LEMALogic/boardroom-moltbot
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/boardroom
+ExecStart=/usr/bin/docker compose -f /home/boardroom/docker-compose.lemalogic.yml up -d
+ExecStop=/usr/bin/docker compose -f /home/boardroom/docker-compose.lemalogic.yml down
+ExecReload=/usr/bin/docker compose -f /home/boardroom/docker-compose.lemalogic.yml restart
+
+# Restart policy
+TimeoutStartSec=300
+TimeoutStopSec=120
+
+# Run as boardroom user
+User=boardroom
+Group=boardroom
+
+# Environment file for gateway tokens
+EnvironmentFile=-/home/boardroom/.env
+
+[Install]
+WantedBy=multi-user.target

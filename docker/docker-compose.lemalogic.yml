@@ -1,0 +1,132 @@
+# LEMA Logic Boardroom Multi-Tenant Docker Compose
+# Architecture: Per-user isolated networks with dedicated proxy containers
+#
+# Security Model:
+# - Each user has their own isolated Docker network
+# - Each user has their own proxy container with their API keys
+# - Console containers can ONLY reach their own proxy (network isolation)
+# - No cross-user communication possible
+#
+# Usage:
+#   docker compose -f docker-compose.lemalogic.yml up -d
+#   docker compose -f docker-compose.lemalogic.yml down
+
+services:
+  #############################################
+  # BRIAN GALLAGHER - Isolated Environment
+  #############################################
+
+  brian-proxy:
+    container_name: brian-lemalogic-proxy
+    image: boardroom-api-proxy:latest
+    restart: unless-stopped
+    volumes:
+      - /home/boardroom/data/brian-proxy:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/health').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - brian-network
+    # No external ports - only accessible within brian-network
+
+  brian-console:
+    container_name: brian-lemalogic-console
+    image: ghcr.io/lemalogic/boardroom-console:amd64
+    restart: unless-stopped
+    environment:
+      - CLAWDBOT_GATEWAY_TOKEN=${BRIAN_GATEWAY_TOKEN:-7b6f0a7bd5f4474efe54c86737f93fc9}
+    ports:
+      - "2222:22"       # SSH
+      - "19001:19001"   # Gateway (for Cloudflare Tunnel)
+    volumes:
+      - /home/boardroom/data/brian-console:/home/boardroom/.clawdbot-dev
+    depends_on:
+      brian-proxy:
+        condition: service_healthy
+    networks:
+      - brian-network
+
+  #############################################
+  # DAN THOMAS - Isolated Environment
+  #############################################
+
+  dan-proxy:
+    container_name: dan-lemalogic-proxy
+    image: boardroom-api-proxy:latest
+    restart: unless-stopped
+    volumes:
+      - /home/boardroom/data/dan-proxy:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/health').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - dan-network
+    # No external ports - only accessible within dan-network
+
+  dan-console:
+    container_name: dan-lemalogic-console
+    image: ghcr.io/lemalogic/boardroom-console:amd64
+    restart: unless-stopped
+    environment:
+      - CLAWDBOT_GATEWAY_TOKEN=${DAN_GATEWAY_TOKEN:-50991b08206888d47a9933ba7d3b37bb}
+    ports:
+      - "2223:22"       # SSH
+      - "19002:19001"   # Gateway (for Cloudflare Tunnel)
+    volumes:
+      - /home/boardroom/data/dan-console:/home/boardroom/.clawdbot-dev
+    depends_on:
+      dan-proxy:
+        condition: service_healthy
+    networks:
+      - dan-network
+
+  #############################################
+  # SHARED ADMIN (Optional - for monitoring)
+  #############################################
+
+  # Admin proxy for monitoring/management only
+  # This is NOT used by any console containers
+  admin-proxy:
+    container_name: lemalogic-admin-proxy
+    image: boardroom-api-proxy:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"   # Admin UI access
+      - "8888:8888"   # Secondary admin port
+    volumes:
+      - /home/boardroom/data/admin-proxy:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/health').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - admin-network
+
+#############################################
+# ISOLATED NETWORKS
+#############################################
+
+networks:
+  brian-network:
+    driver: bridge
+    internal: false  # Allow internet access for web searches
+    # Console can reach: brian-proxy, internet
+    # Console CANNOT reach: dan-proxy, admin-proxy
+
+  dan-network:
+    driver: bridge
+    internal: false  # Allow internet access for web searches
+    # Console can reach: dan-proxy, internet
+    # Console CANNOT reach: brian-proxy, admin-proxy
+
+  admin-network:
+    driver: bridge
+    # Admin proxy is isolated from user networks
