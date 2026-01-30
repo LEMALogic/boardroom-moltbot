@@ -32,6 +32,11 @@ const __dirname = dirname(__filename);
 const DATA_DIR = process.env.DATA_DIR || '/data';
 const ALIASES_FILE = join(DATA_DIR, 'key-aliases.json');
 const CONFIG_FILE = join(DATA_DIR, 'proxy-config.json');
+const MAX_TRACKED_RESPONSE_BYTES = 1_000_000;
+const MAX_ALIAS_TEXT_LENGTH = 256;
+const MAX_DESCRIPTION_LENGTH = 512;
+const MAX_HEADER_VALUE_LENGTH = 512;
+const MAX_KEY_LENGTH = 2048;
 
 // A key alias - complete configuration for one API key
 interface KeyAlias {
@@ -125,6 +130,236 @@ function saveProxyConfig(config: ProxyConfig) {
   ensureDataDir();
   writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
   console.log('[CONFIG] Saved config to', CONFIG_FILE);
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function jsStringLiteral(value: string): string {
+  return JSON.stringify(value);
+}
+
+function safeJsonForHtml(value: unknown): string {
+  return JSON.stringify(value).replace(/</g, '\\u003c');
+}
+
+function normalizeString(value: unknown, maxLength: number, field: string): string {
+  if (typeof value !== 'string') {
+    throw new Error(`Field "${field}" must be a string`);
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    throw new Error(`Field "${field}" is required`);
+  }
+  if (trimmed.length > maxLength) {
+    throw new Error(`Field "${field}" exceeds max length ${maxLength}`);
+  }
+  if (/\p{C}/u.test(trimmed)) {
+    throw new Error(`Field "${field}" contains invalid characters`);
+  }
+  return trimmed;
+}
+
+function normalizeOptionalString(value: unknown, maxLength: number, field: string): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'string') {
+    throw new Error(`Field "${field}" must be a string`);
+  }
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  if (trimmed.length > maxLength) {
+    throw new Error(`Field "${field}" exceeds max length ${maxLength}`);
+  }
+  if (/\p{C}/u.test(trimmed)) {
+    throw new Error(`Field "${field}" contains invalid characters`);
+  }
+  return trimmed;
+}
+
+function validateAliasName(value: string): string {
+  if (!/^[A-Za-z0-9._-]+$/.test(value)) {
+    throw new Error('Alias contains invalid characters');
+  }
+  return value;
+}
+
+function validateHost(value: string): string {
+  const host = value.toLowerCase();
+  if (/\s|\//.test(host)) {
+    throw new Error('Host must be a hostname without spaces or slashes');
+  }
+  return host;
+}
+
+function validateHeaderName(value: string): string {
+  if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(value)) {
+    throw new Error('Header name is invalid');
+  }
+  return value;
+}
+
+function normalizeAliasPayload(body: Partial<KeyAlias>): {
+  alias: string;
+  description: string;
+  host: string;
+  authHeader: string;
+  authPrefix?: string;
+  extraHeaders?: Record<string, string>;
+  key: string;
+  budget?: string;
+  isDefault: boolean;
+} {
+  const aliasRaw = normalizeString(body.alias, MAX_ALIAS_TEXT_LENGTH, 'alias');
+  const alias = validateAliasName(aliasRaw);
+  const host = validateHost(normalizeString(body.host, MAX_ALIAS_TEXT_LENGTH, 'host'));
+  const authHeader = validateHeaderName(normalizeString(body.authHeader, MAX_ALIAS_TEXT_LENGTH, 'authHeader'));
+  const authPrefix = normalizeOptionalString(body.authPrefix, MAX_HEADER_VALUE_LENGTH, 'authPrefix');
+  const key = normalizeString(body.key, MAX_KEY_LENGTH, 'key');
+  const description = normalizeOptionalString(body.description, MAX_DESCRIPTION_LENGTH, 'description') || '';
+  const budget = normalizeOptionalString(body.budget, MAX_ALIAS_TEXT_LENGTH, 'budget');
+  const extraHeaders = normalizeExtraHeaders(body.extraHeaders);
+  const isDefault = Boolean(body.isDefault);
+
+  return {
+    alias,
+    description,
+    host,
+    authHeader,
+    authPrefix,
+    extraHeaders,
+    key,
+    budget,
+    isDefault,
+  };
+}
+
+function normalizeAliasUpdate(body: Partial<KeyAlias>): Partial<KeyAlias> {
+  const update: Partial<KeyAlias> = {};
+
+  if (body.description !== undefined) {
+    update.description = normalizeOptionalString(body.description, MAX_DESCRIPTION_LENGTH, 'description') || '';
+  }
+  if (body.host !== undefined) {
+    update.host = validateHost(normalizeString(body.host, MAX_ALIAS_TEXT_LENGTH, 'host'));
+  }
+  if (body.authHeader !== undefined) {
+    update.authHeader = validateHeaderName(normalizeString(body.authHeader, MAX_ALIAS_TEXT_LENGTH, 'authHeader'));
+  }
+  if (body.authPrefix !== undefined) {
+    update.authPrefix = normalizeOptionalString(body.authPrefix, MAX_HEADER_VALUE_LENGTH, 'authPrefix');
+  }
+  if (body.extraHeaders !== undefined) {
+    update.extraHeaders = normalizeExtraHeaders(body.extraHeaders);
+  }
+  if (body.key !== undefined) {
+    update.key = normalizeString(body.key, MAX_KEY_LENGTH, 'key');
+  }
+  if (body.budget !== undefined) {
+    update.budget = normalizeOptionalString(body.budget, MAX_ALIAS_TEXT_LENGTH, 'budget');
+  }
+  if (body.enabled !== undefined) {
+    update.enabled = Boolean(body.enabled);
+  }
+  if (body.isDefault !== undefined) {
+    update.isDefault = Boolean(body.isDefault);
+  }
+
+  return update;
+}
+
+function normalizeExtraHeaders(value: unknown): Record<string, string> | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('extraHeaders must be an object');
+  }
+  const headers: Record<string, string> = {};
+  for (const [key, rawValue] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof rawValue !== 'string') {
+      throw new Error(`extraHeaders value for "${key}" must be a string`);
+    }
+    const headerName = validateHeaderName(key);
+    const headerValue = normalizeString(rawValue, MAX_HEADER_VALUE_LENGTH, `extraHeaders.${key}`);
+    headers[headerName] = headerValue;
+  }
+  return headers;
+}
+
+const HOP_BY_HOP_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+  'proxy-connection',
+]);
+
+function filterRequestHeaders(original: Headers): Headers {
+  const headers = new Headers();
+  for (const [key, value] of original.entries()) {
+    const lower = key.toLowerCase();
+    if (HOP_BY_HOP_HEADERS.has(lower)) continue;
+    if (lower === 'host' || lower === 'content-length') continue;
+    headers.append(key, value);
+  }
+  return headers;
+}
+
+function filterResponseHeaders(original: Headers): Headers {
+  const headers = new Headers();
+  for (const [key, value] of original.entries()) {
+    const lower = key.toLowerCase();
+    if (HOP_BY_HOP_HEADERS.has(lower)) continue;
+    headers.append(key, value);
+  }
+  return headers;
+}
+
+async function readJsonIfSmall(response: Response, maxBytes: number): Promise<unknown | undefined> {
+  const contentType = response.headers.get('content-type') || '';
+  if (!contentType.toLowerCase().includes('application/json')) {
+    return undefined;
+  }
+
+  const body = response.body;
+  if (!body) return undefined;
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    total += value.length;
+    if (total > maxBytes) {
+      return undefined;
+    }
+    chunks.push(value);
+  }
+
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+
+  try {
+    const text = new TextDecoder().decode(merged);
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
 }
 
 // Load on startup
@@ -421,10 +656,10 @@ app.get('/admin', (c) => {
       </div>
 
       <div class="stats">
-        <div class="stat">
-          <div class="number">${activeCount}</div>
-          <div class="label">Active Aliases</div>
-        </div>
+      <div class="stat">
+        <div class="number">${activeCount}</div>
+        <div class="label">Active Aliases</div>
+      </div>
         <div class="stat">
           <div class="number">${hosts.length}</div>
           <div class="label">Unique Hosts</div>
@@ -508,7 +743,7 @@ app.get('/admin', (c) => {
         ` : hosts.map(host => `
           <div class="host-section">
             <div class="host-header">
-              <h3><code>${host}</code> ${proxyConfig.hostDefaults[host] ? `<span class="badge default">default: ${proxyConfig.hostDefaults[host]}</span>` : ''}</h3>
+              <h3><code>${escapeHtml(host)}</code> ${proxyConfig.hostDefaults[host] ? `<span class="badge default">default: ${escapeHtml(proxyConfig.hostDefaults[host])}</span>` : ''}</h3>
             </div>
             <table class="host-table">
               <thead>
@@ -523,24 +758,24 @@ app.get('/admin', (c) => {
               </thead>
               <tbody>
                 ${aliasesByHost[host].map(a => `
-                  <tr data-alias="${a.alias}">
+                  <tr data-alias="${escapeHtml(a.alias)}">
                     <td>
-                      <strong>${a.alias}</strong>
+                      <strong>${escapeHtml(a.alias)}</strong>
                       ${a.isDefault ? '<span class="badge default" style="margin-left:8px;">default</span>' : ''}
                     </td>
-                    <td style="color:#888;">${a.description || '-'}</td>
-                    <td><code>${a.budget || 'none'}</code></td>
-                    <td><span class="masked">${a.key ? a.key.substring(0, 8) + '...' + a.key.slice(-4) : '(not set)'}</span></td>
+                    <td style="color:#888;">${a.description ? escapeHtml(a.description) : '-'}</td>
+                    <td><code>${a.budget ? escapeHtml(a.budget) : 'none'}</code></td>
+                    <td><span class="masked">${a.key ? escapeHtml(a.key.substring(0, 8) + '...' + a.key.slice(-4)) : '(not set)'}</span></td>
                     <td>
                       <span class="status ${a.enabled ? 'active' : 'inactive'}">
                         ${a.enabled ? '✓ Active' : '✗ Disabled'}
                       </span>
                     </td>
                     <td class="actions">
-                      <button class="secondary" onclick="editAlias('${a.alias}')">Edit</button>
-                      <button class="secondary" onclick="toggleAlias('${a.alias}')">${a.enabled ? 'Disable' : 'Enable'}</button>
-                      <button class="secondary" onclick="setDefault('${a.alias}', '${host}')">Set Default</button>
-                      <button class="danger" onclick="deleteAlias('${a.alias}')">Delete</button>
+                      <button class="secondary" onclick="editAlias(${jsStringLiteral(a.alias)})">Edit</button>
+                      <button class="secondary" onclick="toggleAlias(${jsStringLiteral(a.alias)})">${a.enabled ? 'Disable' : 'Enable'}</button>
+                      <button class="secondary" onclick="setDefault(${jsStringLiteral(a.alias)}, ${jsStringLiteral(host)})">Set Default</button>
+                      <button class="danger" onclick="deleteAlias(${jsStringLiteral(a.alias)})">Delete</button>
                     </td>
                   </tr>
                 `).join('')}
@@ -568,6 +803,12 @@ app.get('/admin', (c) => {
       </div>
 
       <div class="card">
+        <h2>OpenRouter Usage</h2>
+        <p><a href="/admin/openrouter/usage">View current OpenRouter usage (JSON)</a></p>
+        <p><a href="/admin/openrouter/usage/all">View all OpenRouter aliases usage (JSON)</a></p>
+      </div>
+
+      <div class="card">
         <h2>API Reference</h2>
         <table>
           <tr><td><code>GET /v1/aliases</code></td><td>List all aliases (keys redacted)</td></tr>
@@ -580,7 +821,7 @@ app.get('/admin', (c) => {
       </div>
 
       <script>
-        const aliases = ${JSON.stringify(aliases.map(a => ({ ...a, key: a.key ? a.key.substring(0, 8) + '...' : '' })))};
+        const aliases = ${safeJsonForHtml(aliases.map(a => ({ ...a, key: a.key ? a.key.substring(0, 8) + '...' : '' })))};
 
         document.getElementById('add-alias-form').addEventListener('submit', async (e) => {
           e.preventDefault();
@@ -661,28 +902,36 @@ app.get('/v1/aliases', (c) => {
 
 // Add new alias
 app.post('/v1/aliases', async (c) => {
-  const body = await c.req.json() as Partial<KeyAlias>;
+  let body: Partial<KeyAlias>;
+  try {
+    body = await c.req.json() as Partial<KeyAlias>;
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
 
-  if (!body.alias || !body.host || !body.authHeader || !body.key) {
-    return c.json({ error: 'Missing required fields: alias, host, authHeader, key' }, 400);
+  let normalized;
+  try {
+    normalized = normalizeAliasPayload(body);
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : 'Invalid alias payload' }, 400);
   }
 
   // Check for duplicate alias name
-  if (aliasStore.aliases.some(a => a.alias === body.alias)) {
-    return c.json({ error: `Alias "${body.alias}" already exists` }, 409);
+  if (aliasStore.aliases.some(a => a.alias === normalized.alias)) {
+    return c.json({ error: `Alias "${normalized.alias}" already exists` }, 409);
   }
 
   const newAlias: KeyAlias = {
-    alias: body.alias,
-    description: body.description || '',
-    host: body.host,
-    authHeader: body.authHeader,
-    authPrefix: body.authPrefix,
-    extraHeaders: body.extraHeaders,
-    key: body.key,
-    budget: body.budget,
+    alias: normalized.alias,
+    description: normalized.description,
+    host: normalized.host,
+    authHeader: normalized.authHeader,
+    authPrefix: normalized.authPrefix,
+    extraHeaders: normalized.extraHeaders,
+    key: normalized.key,
+    budget: normalized.budget,
     enabled: proxyConfig.requireApproval ? false : true,
-    isDefault: body.isDefault || false,
+    isDefault: normalized.isDefault,
     addedAt: new Date().toISOString(),
     usageCount: 0,
   };
@@ -693,6 +942,11 @@ app.post('/v1/aliases', async (c) => {
 
   // If marked as default, update host defaults
   if (newAlias.isDefault) {
+    for (const alias of aliasStore.aliases) {
+      if (alias.host === newAlias.host && alias.alias !== newAlias.alias) {
+        alias.isDefault = false;
+      }
+    }
     proxyConfig.hostDefaults[newAlias.host] = newAlias.alias;
     saveProxyConfig(proxyConfig);
   }
@@ -713,30 +967,58 @@ app.post('/v1/aliases', async (c) => {
 // Update alias
 app.put('/v1/aliases/:alias', async (c) => {
   const aliasName = c.req.param('alias');
-  const body = await c.req.json() as Partial<KeyAlias>;
+  let body: Partial<KeyAlias>;
+  try {
+    body = await c.req.json() as Partial<KeyAlias>;
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
 
   const index = aliasStore.aliases.findIndex(a => a.alias === aliasName);
   if (index === -1) {
     return c.json({ error: `Alias "${aliasName}" not found` }, 404);
   }
 
+  let updates: Partial<KeyAlias>;
+  try {
+    updates = normalizeAliasUpdate(body);
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : 'Invalid alias update' }, 400);
+  }
+
+  const previousHost = aliasStore.aliases[index].host;
+
   // Update fields
   const alias = aliasStore.aliases[index];
-  if (body.description !== undefined) alias.description = body.description;
-  if (body.host !== undefined) alias.host = body.host;
-  if (body.authHeader !== undefined) alias.authHeader = body.authHeader;
-  if (body.authPrefix !== undefined) alias.authPrefix = body.authPrefix;
-  if (body.extraHeaders !== undefined) alias.extraHeaders = body.extraHeaders;
-  if (body.key !== undefined) alias.key = body.key;
-  if (body.budget !== undefined) alias.budget = body.budget;
-  if (body.enabled !== undefined) alias.enabled = body.enabled;
-  if (body.isDefault !== undefined) {
-    alias.isDefault = body.isDefault;
-    if (body.isDefault) {
-      proxyConfig.hostDefaults[alias.host] = alias.alias;
-      saveProxyConfig(proxyConfig);
-    }
+  if (updates.description !== undefined) alias.description = updates.description;
+  if (updates.host !== undefined) alias.host = updates.host;
+  if (updates.authHeader !== undefined) alias.authHeader = updates.authHeader;
+  if (updates.authPrefix !== undefined) alias.authPrefix = updates.authPrefix;
+  if (updates.extraHeaders !== undefined) alias.extraHeaders = updates.extraHeaders;
+  if (updates.key !== undefined) alias.key = updates.key;
+  if (updates.budget !== undefined) alias.budget = updates.budget;
+  if (updates.enabled !== undefined) alias.enabled = updates.enabled;
+
+  if (updates.isDefault !== undefined) {
+    alias.isDefault = updates.isDefault;
   }
+
+  if (previousHost !== alias.host && proxyConfig.hostDefaults[previousHost] === alias.alias) {
+    delete proxyConfig.hostDefaults[previousHost];
+  }
+
+  if (alias.isDefault) {
+    for (const other of aliasStore.aliases) {
+      if (other.host === alias.host && other.alias !== alias.alias) {
+        other.isDefault = false;
+      }
+    }
+    proxyConfig.hostDefaults[alias.host] = alias.alias;
+  } else if (proxyConfig.hostDefaults[alias.host] === alias.alias) {
+    delete proxyConfig.hostDefaults[alias.host];
+  }
+
+  saveProxyConfig(proxyConfig);
 
   aliasStore.version++;
   saveAliasStore(aliasStore);
@@ -786,33 +1068,43 @@ app.post('/v1/aliases/:alias/toggle', (c) => {
 
 // Set default alias for a host
 app.post('/admin/api/default', async (c) => {
-  const body = await c.req.json() as { host: string; alias: string };
+  let body: { host: string; alias: string };
+  try {
+    body = await c.req.json() as { host: string; alias: string };
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
 
-  if (!body.host || !body.alias) {
-    return c.json({ error: 'Missing host or alias' }, 400);
+  let host: string;
+  let aliasName: string;
+  try {
+    host = validateHost(normalizeString(body.host, MAX_ALIAS_TEXT_LENGTH, 'host'));
+    aliasName = validateAliasName(normalizeString(body.alias, MAX_ALIAS_TEXT_LENGTH, 'alias'));
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : 'Invalid host or alias' }, 400);
   }
 
   // Verify alias exists and matches host
-  const alias = aliasStore.aliases.find(a => a.alias === body.alias);
+  const alias = aliasStore.aliases.find(a => a.alias === aliasName);
   if (!alias) {
-    return c.json({ error: `Alias "${body.alias}" not found` }, 404);
+    return c.json({ error: `Alias "${aliasName}" not found` }, 404);
   }
-  if (alias.host !== body.host) {
-    return c.json({ error: `Alias "${body.alias}" is for host "${alias.host}", not "${body.host}"` }, 400);
+  if (alias.host !== host) {
+    return c.json({ error: `Alias "${aliasName}" is for host "${alias.host}", not "${host}"` }, 400);
   }
 
   // Clear isDefault on other aliases for this host
   for (const a of aliasStore.aliases) {
-    if (a.host === body.host) {
-      a.isDefault = a.alias === body.alias;
+    if (a.host === host) {
+      a.isDefault = a.alias === aliasName;
     }
   }
 
-  proxyConfig.hostDefaults[body.host] = body.alias;
+  proxyConfig.hostDefaults[host] = aliasName;
   saveProxyConfig(proxyConfig);
   saveAliasStore(aliasStore);
 
-  return c.json({ success: true, host: body.host, defaultAlias: body.alias });
+  return c.json({ success: true, host, defaultAlias: aliasName });
 });
 
 // Cost tracking endpoints
@@ -862,6 +1154,154 @@ app.post('/v1/redact', async (c) => {
 });
 
 // =============================================================================
+// OPENROUTER USAGE ENDPOINT
+// =============================================================================
+// Fetches usage data from OpenRouter for a specific key
+
+app.get('/admin/openrouter/usage', async (c) => {
+  const aliasName = c.req.query('alias');
+
+  // Find OpenRouter aliases
+  const openrouterAliases = aliasStore.aliases.filter(a =>
+    a.host === 'openrouter.ai' && a.enabled
+  );
+
+  if (openrouterAliases.length === 0) {
+    return c.json({ error: 'No OpenRouter aliases configured' }, 404);
+  }
+
+  // If alias specified, find it; otherwise use default or first
+  let alias: KeyAlias | undefined;
+  if (aliasName) {
+    alias = openrouterAliases.find(a => a.alias === aliasName);
+    if (!alias) {
+      return c.json({ error: `Alias "${aliasName}" not found` }, 404);
+    }
+  } else {
+    alias = getDefaultAliasForHost('openrouter.ai') || openrouterAliases[0];
+  }
+
+  try {
+    // Call OpenRouter's /api/v1/auth/key endpoint to get key info
+    const response = await fetch('https://openrouter.ai/api/v1/auth/key', {
+      headers: {
+        'Authorization': `Bearer ${alias.key}`,
+      },
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      return c.json({
+        error: 'Failed to fetch usage from OpenRouter',
+        status: response.status,
+        details: errorText,
+      }, response.status as any);
+    }
+
+    const data = await response.json() as {
+      data?: {
+        label?: string;
+        usage?: number;
+        limit?: number | null;
+        limit_remaining?: number | null;
+        is_free_tier?: boolean;
+        rate_limit?: {
+          requests?: number;
+          interval?: string;
+        };
+      };
+    };
+
+    // Return usage data with alias info
+    return c.json({
+      alias: alias.alias,
+      budget: alias.budget,
+      usage: {
+        totalSpend: data.data?.usage || 0,
+        limit: data.data?.limit || null,
+        limitRemaining: data.data?.limit_remaining || null,
+        isFreeTier: data.data?.is_free_tier || false,
+        rateLimit: data.data?.rate_limit || null,
+      },
+      local: {
+        usageCount: alias.usageCount || 0,
+        lastUsed: alias.lastUsed || null,
+      },
+    });
+  } catch (err) {
+    console.error('[OPENROUTER] Error fetching usage:', err);
+    return c.json({
+      error: 'Failed to fetch usage from OpenRouter',
+      details: err instanceof Error ? err.message : String(err),
+    }, 500);
+  }
+});
+
+// Get usage for all OpenRouter aliases
+app.get('/admin/openrouter/usage/all', async (c) => {
+  const openrouterAliases = aliasStore.aliases.filter(a =>
+    a.host === 'openrouter.ai' && a.enabled
+  );
+
+  if (openrouterAliases.length === 0) {
+    return c.json({ aliases: [], totalSpend: 0 });
+  }
+
+  const results = await Promise.all(openrouterAliases.map(async (alias) => {
+    try {
+      const response = await fetch('https://openrouter.ai/api/v1/auth/key', {
+        headers: { 'Authorization': `Bearer ${alias.key}` },
+      });
+
+      if (!response.ok) {
+        return {
+          alias: alias.alias,
+          budget: alias.budget,
+          error: `HTTP ${response.status}`,
+        };
+      }
+
+      const data = await response.json() as {
+        data?: {
+          usage?: number;
+          limit?: number | null;
+          limit_remaining?: number | null;
+        };
+      };
+
+      return {
+        alias: alias.alias,
+        budget: alias.budget,
+        usage: data.data?.usage || 0,
+        limit: data.data?.limit || null,
+        limitRemaining: data.data?.limit_remaining || null,
+        usageCount: alias.usageCount || 0,
+        lastUsed: alias.lastUsed || null,
+      };
+    } catch (err) {
+      return {
+        alias: alias.alias,
+        budget: alias.budget,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }));
+
+  const totalSpend = results.reduce((sum, r) => {
+    if ('usage' in r && typeof r.usage === 'number') {
+      return sum + r.usage;
+    }
+    return sum;
+  }, 0);
+
+  return c.json({
+    aliases: results,
+    totalSpend,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// =============================================================================
 // FORWARD PROXY ROUTES - Direct API forwarding with key injection
 // =============================================================================
 // These routes allow clients to call /proxy/{provider}/* and have requests
@@ -892,24 +1332,17 @@ async function forwardWithKey(
   const targetUrl = `https://${targetHost}${targetPath}`;
 
   // Build headers - copy from original request, add auth
-  const headers: Record<string, string> = {};
-
-  // Copy relevant headers from original request
-  const originalHeaders = c.req.raw.headers;
-  for (const [key, value] of originalHeaders.entries()) {
-    // Skip hop-by-hop headers and host
-    if (!['host', 'connection', 'keep-alive', 'transfer-encoding', 'authorization'].includes(key.toLowerCase())) {
-      headers[key] = value;
-    }
-  }
+  const headers = filterRequestHeaders(c.req.raw.headers);
 
   // Add the API key
   const authValue = (alias.authPrefix || '') + alias.key;
-  headers[alias.authHeader] = authValue;
+  headers.set(alias.authHeader, authValue);
 
   // Add extra headers if configured
   if (alias.extraHeaders) {
-    Object.assign(headers, alias.extraHeaders);
+    for (const [key, value] of Object.entries(alias.extraHeaders)) {
+      headers.set(key, value);
+    }
   }
 
   // Log the request
@@ -920,49 +1353,31 @@ async function forwardWithKey(
   alias.usageCount = (alias.usageCount || 0) + 1;
 
   try {
-    // Forward the request
-    const response = await fetch(targetUrl, {
+    const isBodyless = ['GET', 'HEAD'].includes(c.req.method);
+    const init: RequestInit & { duplex?: 'half' } = {
       method: c.req.method,
       headers,
-      body: ['GET', 'HEAD'].includes(c.req.method) ? undefined : await c.req.raw.clone().text(),
-    });
-
-    // Log cost tracking
-    const responseClone = response.clone();
-    const responseBody = await responseClone.text();
-
-    // Try to parse for token usage
-    try {
-      const json = JSON.parse(responseBody);
-      if (json.usage) {
-        const entry: CostEntry = {
-          timestamp: new Date().toISOString(),
-          host: targetHost,
-          alias: alias.alias,
-          budget: alias.budget,
-          method: c.req.method,
-          path: targetPath,
-          inputTokens: json.usage.prompt_tokens,
-          outputTokens: json.usage.completion_tokens,
-          model: json.model,
-        };
-        // Estimate cost (rough OpenRouter pricing)
-        if (entry.inputTokens && entry.outputTokens) {
-          entry.estimatedCost = (entry.inputTokens * 0.000015) + (entry.outputTokens * 0.000075);
-        }
-        costLog.push(entry);
-        if (costLog.length > 1000) costLog.shift();
-      }
-    } catch {
-      // Not JSON or no usage info - that's OK
+      body: isBodyless ? undefined : c.req.raw.body,
+    };
+    if (!isBodyless) {
+      init.duplex = 'half';
     }
 
-    // Return the response
-    return new Response(responseBody, {
+    // Forward the request
+    const response = await fetch(targetUrl, init);
+
+    // Log cost tracking without blocking the response stream
+    void (async () => {
+      const usagePayload = await readJsonIfSmall(response.clone(), MAX_TRACKED_RESPONSE_BYTES);
+      if (usagePayload) {
+        trackCost(alias, targetPath, c.req.method, usagePayload);
+      }
+    })();
+
+    // Return the streamed response with preserved headers
+    return new Response(response.body, {
       status: response.status,
-      headers: {
-        'content-type': response.headers.get('content-type') || 'application/json',
-      },
+      headers: filterResponseHeaders(response.headers),
     });
   } catch (err) {
     console.error(`[FORWARD] Error forwarding to ${targetUrl}:`, err);
@@ -1094,29 +1509,48 @@ mitmProxy.onResponse((ctx: any, callback: () => void) => {
   let alias = aliasHeader ? getAliasByName(aliasHeader) : getDefaultAliasForHost(host);
 
   if (alias) {
-    // Collect response body for cost tracking
+    // Collect response body for cost tracking, with size guard
     let responseBody = '';
+    let responseBytes = 0;
+    let trackingDisabled = false;
+    const contentType = String(ctx.proxyToClientResponse.getHeader('content-type') || '');
     const originalWrite = ctx.proxyToClientResponse.write.bind(ctx.proxyToClientResponse);
     const originalEnd = ctx.proxyToClientResponse.end.bind(ctx.proxyToClientResponse);
 
     ctx.proxyToClientResponse.write = function(chunk: any, ...args: any[]) {
-      if (chunk) {
-        responseBody += chunk.toString();
+      if (chunk && !trackingDisabled) {
+        const chunkBytes = Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(String(chunk));
+        responseBytes += chunkBytes;
+        if (responseBytes <= MAX_TRACKED_RESPONSE_BYTES) {
+          responseBody += chunk.toString();
+        } else {
+          trackingDisabled = true;
+          responseBody = '';
+        }
       }
       return originalWrite(chunk, ...args);
     };
 
     ctx.proxyToClientResponse.end = function(chunk: any, ...args: any[]) {
-      if (chunk) {
-        responseBody += chunk.toString();
+      if (chunk && !trackingDisabled) {
+        const chunkBytes = Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(String(chunk));
+        responseBytes += chunkBytes;
+        if (responseBytes <= MAX_TRACKED_RESPONSE_BYTES) {
+          responseBody += chunk.toString();
+        } else {
+          trackingDisabled = true;
+          responseBody = '';
+        }
       }
 
       // Track cost asynchronously
-      try {
-        const parsedResponse = JSON.parse(responseBody);
-        trackCost(alias!, ctx.clientToProxyRequest.url || '', ctx.clientToProxyRequest.method || 'GET', parsedResponse);
-      } catch {
-        // Not JSON, skip cost tracking
+      if (!trackingDisabled && contentType.toLowerCase().includes('application/json')) {
+        try {
+          const parsedResponse = JSON.parse(responseBody);
+          trackCost(alias!, ctx.clientToProxyRequest.url || '', ctx.clientToProxyRequest.method || 'GET', parsedResponse);
+        } catch {
+          // Not JSON, skip cost tracking
+        }
       }
 
       return originalEnd(chunk, ...args);
@@ -1165,6 +1599,7 @@ serve({
 
 // Start MITM proxy
 mitmProxy.listen({
+  host: '0.0.0.0',
   port: serverConfig.proxyPort,
   sslCaDir: certsDir,
 }, () => {

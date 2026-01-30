@@ -143,7 +143,7 @@ services:
       # Persist proxy data (caching, rate limiting state, etc.)
       - ../proxy-data:/data
       # Generated MITM CA certificates (shared with console)
-      - proxy-certs:/app/api-proxy/certs/.http-mitm-proxy
+      - proxy-certs:/app/certs/.http-mitm-proxy
     networks:
       - boardroom-network
     restart: unless-stopped
